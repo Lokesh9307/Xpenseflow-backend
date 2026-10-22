@@ -112,9 +112,30 @@ router.get('/groups/:id', auth, async (req, res) => {
       await group.save();
     }
 
+    // Month filtering & auto-reset on 1st of month
+    const now = new Date();
+    const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const selectedMonthKey = (req.query.month && /^\d{4}-\d{2}$/.test(req.query.month))
+      ? req.query.month
+      : currentMonthKey;
+
+    const [sYear, sMonth] = selectedMonthKey.split('-').map(Number);
+    const monthStart = new Date(sYear, sMonth - 1, 1, 0, 0, 0, 0);
+    const monthEnd = new Date(sYear, sMonth, 1, 0, 0, 0, 0);
+
     const entries = await TiffinEntry.find({ groupId: group._id }).sort({ date: -1 });
 
-    const now = new Date();
+    // Available months list across all recorded entries
+    const monthSet = new Set([currentMonthKey, selectedMonthKey]);
+    entries.forEach((e) => {
+      if (e.date) {
+        try {
+          monthSet.add(new Date(e.date).toISOString().slice(0, 7));
+        } catch (_) {}
+      }
+    });
+    const availableMonths = Array.from(monthSet).sort().reverse();
+
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
 
@@ -123,40 +144,93 @@ router.get('/groups/:id', auth, async (req, res) => {
       return d >= todayStart && d < todayEnd;
     });
 
+    // Entries for the selected month (resets to 0 on 1st of every month automatically)
+    const monthEntries = entries.filter((e) => {
+      const d = new Date(e.date);
+      return d >= monthStart && d < monthEnd;
+    });
+
+    const monthTotal = monthEntries.reduce((s, e) => s + (e.totalPrice || 0), 0);
+    const monthQuantity = monthEntries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
+
+    // Lifetime totals
     const cycleTotal = entries.reduce((s, e) => s + (e.totalPrice || 0), 0);
     const cycleQuantity = entries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
 
-    // Member totals
+    // Compute detailed member stats for the selected month
     const memberTotals = {};
+    const memberStats = {};
     group.members.forEach((m) => {
-      memberTotals[String(m._id || m.userId)] = 0;
+      const mId = String(m._id || m.userId);
+      memberTotals[mId] = 0;
+      memberStats[mId] = {
+        memberId: mId,
+        name: m.name || 'Member',
+        email: m.email || '',
+        mealsCount: 0,
+        extraTiffins: 0,
+        baseTotal: 0,
+        extraTotal: 0,
+        totalDue: 0,
+      };
     });
 
-    entries.forEach((e) => {
+    monthEntries.forEach((e) => {
       if (e.noTiffin || e.mealType === 'none') return;
+      const pricePerUnit = group.pricePerTiffin || group.defaultPrice || 80;
+
       if (e.memberBills && Object.keys(e.memberBills).length > 0) {
         Object.entries(e.memberBills).forEach(([id, amt]) => {
-          memberTotals[id] = (memberTotals[id] || 0) + (parseFloat(amt) || 0);
+          const due = parseFloat(amt) || 0;
+          memberTotals[id] = (memberTotals[id] || 0) + due;
+          if (memberStats[id]) {
+            const extraCount = (e.extras && e.extras[id]) ? parseInt(e.extras[id], 10) || 0 : 0;
+            const extraAmt = extraCount * pricePerUnit;
+            const baseAmt = Math.max(0, due - extraAmt);
+            memberStats[id].totalDue += due;
+            memberStats[id].extraTiffins += extraCount;
+            memberStats[id].extraTotal += extraAmt;
+            memberStats[id].baseTotal += baseAmt;
+            if (due > 0) memberStats[id].mealsCount += 1;
+          }
         });
       } else if (Array.isArray(e.participants) && e.participants.length > 0) {
         const share = (e.totalPrice || 0) / e.participants.length;
         e.participants.forEach((p) => {
           const id = String(p.memberId);
           memberTotals[id] = (memberTotals[id] || 0) + share;
+          if (memberStats[id]) {
+            memberStats[id].totalDue += share;
+            memberStats[id].baseTotal += share;
+            memberStats[id].mealsCount += 1;
+          }
         });
       } else {
         const id = String(e.userId);
         memberTotals[id] = (memberTotals[id] || 0) + (e.totalPrice || 0);
+        if (memberStats[id]) {
+          memberStats[id].totalDue += (e.totalPrice || 0);
+          memberStats[id].baseTotal += (e.totalPrice || 0);
+          memberStats[id].mealsCount += 1;
+        }
       }
     });
 
     return res.json({
       group,
-      entries,
+      selectedMonth: selectedMonthKey,
+      availableMonths,
+      entries: monthEntries, // Default to monthEntries for monthly ledger
+      allEntries: entries,
       todayEntries,
-      cycleTotal,
-      cycleQuantity,
+      monthTotal,
+      monthQuantity,
+      cycleTotal: monthTotal, // Cycle total now represents the active month
+      cycleQuantity: monthQuantity,
+      lifetimeTotal: cycleTotal,
+      lifetimeQuantity: cycleQuantity,
       memberTotals,
+      memberStats: Object.values(memberStats),
       inviteCode: group.inviteCode,
       isCreator: String(group.createdBy) === userId,
       canWrite: true,
@@ -238,11 +312,11 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
   }
 });
 
-// PATCH /api/tiffin/groups/:id/entries/:entryId — edit entry
+// PATCH /api/tiffin/groups/:id/entries/:entryId — edit entry with full split recalculation
 router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
   try {
     const { id: groupId, entryId } = req.params;
-    const { mealType, count, quantity, extraPrice, notes, date, noTiffin, participants } = req.body;
+    const { mealType, count, quantity, baseQuantity, splitMemberIds, extras, extraPrice, notes, date, noTiffin, participants } = req.body;
 
     const group = await TiffinGroup.findById(groupId);
     if (!group) return res.status(404).json({ message: 'Group not found' });
@@ -251,24 +325,58 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
     if (!entry) return res.status(404).json({ message: 'Entry not found' });
 
     const isNoMeal = noTiffin === true || mealType === 'none';
+    const pricePerUnit = group.defaultPrice || group.pricePerTiffin || 80;
+
     if (isNoMeal) {
       entry.noTiffin = true;
       entry.mealType = 'none';
       entry.count = 0;
       entry.quantity = 0;
+      entry.baseQuantity = 0;
+      entry.extras = {};
+      entry.memberBills = {};
       entry.extraPrice = 0;
       entry.totalPrice = 0;
       entry.notes = notes || 'No one took tiffin today';
     } else {
-      if (mealType) entry.mealType = mealType.toLowerCase();
-      const mealCount = Math.max(1, parseInt(quantity || count || entry.quantity || 1, 10));
-      const extra = extraPrice !== undefined ? parseFloat(extraPrice) || 0 : (entry.extraPrice || 0);
-      const pricePerUnit = group.defaultPrice || group.pricePerTiffin || 80;
-      entry.count = mealCount;
-      entry.quantity = mealCount;
-      entry.extraPrice = extra;
-      entry.totalPrice = pricePerUnit * mealCount + extra;
       entry.noTiffin = false;
+      if (mealType) entry.mealType = mealType.toLowerCase();
+
+      const baseQty = baseQuantity !== undefined
+        ? parseInt(baseQuantity, 10)
+        : (parseInt(quantity || count || entry.baseQuantity || 1, 10));
+
+      const splitIds = Array.isArray(splitMemberIds) && splitMemberIds.length > 0
+        ? splitMemberIds
+        : (entry.splitMemberIds && entry.splitMemberIds.length > 0 ? entry.splitMemberIds : group.members.map((m) => String(m._id || m.userId)));
+
+      const extrasMap = extras !== undefined ? extras : (entry.extras || {});
+      const extraTiffinsTotal = Object.values(extrasMap).reduce((s, k) => s + (parseInt(k, 10) || 0), 0);
+      const totalQty = baseQty + extraTiffinsTotal;
+
+      entry.count = totalQty;
+      entry.quantity = totalQty;
+      entry.baseQuantity = baseQty;
+      entry.splitMemberIds = splitIds;
+      entry.extras = extrasMap;
+
+      const extraVal = extraPrice !== undefined ? parseFloat(extraPrice) || 0 : (entry.extraPrice || 0);
+      entry.extraPrice = extraVal;
+      entry.totalPrice = (baseQty * pricePerUnit) + (extraTiffinsTotal * pricePerUnit) + extraVal;
+
+      // Recalculate member bills
+      const basePerPerson = splitIds.length > 0 ? (baseQty * pricePerUnit) / splitIds.length : 0;
+      const memberBills = {};
+      group.members.forEach((m) => {
+        const mId = String(m._id || m.userId);
+        let bill = splitIds.includes(mId) ? basePerPerson : 0;
+        if (extrasMap[mId]) {
+          bill += (parseInt(extrasMap[mId], 10) || 0) * pricePerUnit;
+        }
+        memberBills[mId] = Math.round(bill * 100) / 100;
+      });
+      entry.memberBills = memberBills;
+
       if (notes !== undefined) entry.notes = notes;
       if (participants !== undefined) entry.participants = participants;
     }
