@@ -11,6 +11,10 @@ const tiffinEntrySchema = new mongoose.Schema(
     extraPrice: { type: Number, default: 0 },
     totalPrice: { type: Number, default: 80 },
     noTiffin: { type: Boolean, default: false },
+    baseQuantity: { type: Number },
+    splitMemberIds: [{ type: String }],
+    extras: { type: mongoose.Schema.Types.Mixed, default: {} },
+    memberBills: { type: mongoose.Schema.Types.Mixed, default: {} },
     participants: [
       {
         memberId: { type: String },

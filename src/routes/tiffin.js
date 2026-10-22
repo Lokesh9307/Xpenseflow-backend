@@ -134,7 +134,11 @@ router.get('/groups/:id', auth, async (req, res) => {
 
     entries.forEach((e) => {
       if (e.noTiffin || e.mealType === 'none') return;
-      if (Array.isArray(e.participants) && e.participants.length > 0) {
+      if (e.memberBills && Object.keys(e.memberBills).length > 0) {
+        Object.entries(e.memberBills).forEach(([id, amt]) => {
+          memberTotals[id] = (memberTotals[id] || 0) + (parseFloat(amt) || 0);
+        });
+      } else if (Array.isArray(e.participants) && e.participants.length > 0) {
         const share = (e.totalPrice || 0) / e.participants.length;
         e.participants.forEach((p) => {
           const id = String(p.memberId);
@@ -168,17 +172,46 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const groupId = req.params.id;
-    const { mealType, count, quantity, extraPrice, notes, date, noTiffin, participants } = req.body;
+    const { mealType, count, quantity, baseQuantity, splitMemberIds, extras, extraPrice, notes, date, noTiffin, participants } = req.body;
 
     const group = await TiffinGroup.findById(groupId);
     if (!group) return res.status(404).json({ message: 'Group not found' });
 
     const isNoMeal = noTiffin === true || mealType === 'none' || count === 0 || quantity === 0;
     const normalizedMeal = isNoMeal ? 'none' : (mealType || 'lunch').toLowerCase();
-    const mealCount = isNoMeal ? 0 : Math.max(1, parseInt(quantity || count, 10) || 1);
-    const extra = isNoMeal ? 0 : parseFloat(extraPrice) || 0;
     const pricePerUnit = group.defaultPrice || group.pricePerTiffin || 80;
-    const totalPrice = isNoMeal ? 0 : pricePerUnit * mealCount + extra;
+
+    let mealCount = 0;
+    let totalPrice = 0;
+    let memberBills = {};
+    let splitIds = [];
+    let extrasMap = extras || {};
+
+    if (!isNoMeal) {
+      const baseQty = baseQuantity !== undefined
+        ? parseInt(baseQuantity, 10)
+        : (parseInt(quantity || count, 10) || 1);
+
+      splitIds = Array.isArray(splitMemberIds) && splitMemberIds.length > 0
+        ? splitMemberIds
+        : group.members.map((m) => String(m._id || m.userId));
+
+      const extraTiffinsTotal = Object.values(extrasMap).reduce((s, k) => s + (parseInt(k, 10) || 0), 0);
+      mealCount = baseQty + extraTiffinsTotal;
+      const extraVal = parseFloat(extraPrice) || 0;
+      totalPrice = (baseQty * pricePerUnit) + (extraTiffinsTotal * pricePerUnit) + extraVal;
+
+      // Calculate member bills (base shared evenly + extra tiffins at full price)
+      const basePerPerson = splitIds.length > 0 ? (baseQty * pricePerUnit) / splitIds.length : 0;
+      group.members.forEach((m) => {
+        const mId = String(m._id || m.userId);
+        let bill = splitIds.includes(mId) ? basePerPerson : 0;
+        if (extrasMap[mId]) {
+          bill += (parseInt(extrasMap[mId], 10) || 0) * pricePerUnit;
+        }
+        memberBills[mId] = Math.round(bill * 100) / 100;
+      });
+    }
 
     const entry = await TiffinEntry.create({
       groupId,
@@ -187,7 +220,11 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
       mealType: normalizedMeal,
       count: mealCount,
       quantity: mealCount,
-      extraPrice: extra,
+      baseQuantity: isNoMeal ? 0 : (baseQuantity || mealCount),
+      splitMemberIds: splitIds,
+      extras: extrasMap,
+      memberBills,
+      extraPrice: isNoMeal ? 0 : (parseFloat(extraPrice) || 0),
       totalPrice,
       noTiffin: isNoMeal,
       participants: Array.isArray(participants) ? participants : [],
