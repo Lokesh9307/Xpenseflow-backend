@@ -5,10 +5,19 @@ const tiffinEntrySchema = new mongoose.Schema(
     groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'TiffinGroup', required: true, index: true },
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     date: { type: Date, default: Date.now },
-    mealType: { type: String, default: 'Lunch' },
+    mealType: { type: String, default: 'lunch' }, // 'breakfast', 'lunch', 'dinner', 'none'
     count: { type: Number, default: 1 },
+    quantity: { type: Number, default: 1 },
     extraPrice: { type: Number, default: 0 },
     totalPrice: { type: Number, default: 80 },
+    noTiffin: { type: Boolean, default: false },
+    participants: [
+      {
+        memberId: { type: String },
+        name: { type: String },
+        quantity: { type: Number, default: 1 },
+      },
+    ],
     notes: { type: String, default: '' },
   },
   { timestamps: true }
