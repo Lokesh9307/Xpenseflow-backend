@@ -85,6 +85,42 @@ router.post('/groups', auth, async (req, res) => {
   }
 });
 
+// PATCH /api/tiffin/groups/:id — update group configuration (name, pricePerTiffin, etc.)
+router.patch('/groups/:id', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const groupId = req.params.id;
+    const { name, defaultPrice, pricePerTiffin } = req.body;
+
+    const group = await TiffinGroup.findById(groupId);
+    if (!group) return res.status(404).json({ message: 'Group not found' });
+
+    // Verify creator or member
+    const isAllowed =
+      String(group.createdBy) === userId ||
+      group.members.some((m) => m.userId && String(m.userId) === userId);
+
+    if (!isAllowed) {
+      return res.status(403).json({ message: 'Not authorized to edit this group' });
+    }
+
+    if (name && name.trim()) {
+      group.name = name.trim();
+    }
+    if (defaultPrice !== undefined || pricePerTiffin !== undefined) {
+      const price = parseFloat(defaultPrice ?? pricePerTiffin) || 80;
+      group.defaultPrice = price;
+      group.pricePerTiffin = price;
+    }
+
+    await group.save();
+    return res.json(group);
+  } catch (err) {
+    console.error('PATCH /api/tiffin/groups/:id error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
 // GET /api/tiffin/groups/:id — detailed group view with today entries and history
 router.get('/groups/:id', auth, async (req, res) => {
   try {
