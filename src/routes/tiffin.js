@@ -5,8 +5,20 @@ const auth = require('../middleware/auth');
 const TiffinGroup = require('../models/TiffinGroup');
 const TiffinEntry = require('../models/TiffinEntry');
 
-// Helper to generate 4-digit code
-const generate4DigitCode = () => Math.floor(1000 + Math.random() * 9000).toString();
+// Helper to generate static, unique 4-digit code per group
+const getStaticGroupCode = (groupOrId) => {
+  if (!groupOrId) return '8824';
+  if (typeof groupOrId === 'object' && groupOrId.inviteCode && /^\d{4}$/.test(String(groupOrId.inviteCode))) {
+    return String(groupOrId.inviteCode);
+  }
+  const idStr = String(typeof groupOrId === 'object' ? (groupOrId._id || groupOrId.id || groupOrId.name) : groupOrId);
+  let hash = 0;
+  for (let i = 0; i < idStr.length; i++) {
+    hash = (hash << 5) - hash + idStr.charCodeAt(i);
+    hash |= 0;
+  }
+  return String(Math.abs(hash) % 9000 + 1000);
+};
 
 // GET /api/tiffin/groups — list all groups user is member of or created
 router.get('/groups', auth, async (req, res) => {
@@ -20,6 +32,13 @@ router.get('/groups', auth, async (req, res) => {
     // Enhance each group with active cycle spend and entry count
     const enhancedGroups = await Promise.all(
       groups.map(async (group) => {
+        let staticCode = group.inviteCode;
+        if (!staticCode || !/^\d{4}$/.test(String(staticCode))) {
+          staticCode = getStaticGroupCode(group);
+          group.inviteCode = staticCode;
+          group.save().catch(() => {});
+        }
+
         const entries = await TiffinEntry.find({ groupId: group._id });
         const cycleTotal = entries.reduce((s, e) => s + (e.totalPrice || 0), 0);
         const cycleQuantity = entries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
@@ -29,7 +48,7 @@ router.get('/groups', auth, async (req, res) => {
           cycleTotal,
           cycleQuantity,
           entryCount: entries.length,
-          inviteCode: group.inviteCode || generate4DigitCode(),
+          inviteCode: staticCode,
         };
       })
     );
@@ -52,7 +71,6 @@ router.post('/groups', auth, async (req, res) => {
     }
 
     const price = Number(defaultPrice || pricePerTiffin || 80);
-    const inviteCode = generate4DigitCode();
 
     const initialMembers = [
       { userId, name: req.user.name || 'Admin', email: req.user.email || '' },
@@ -69,14 +87,15 @@ router.post('/groups', auth, async (req, res) => {
       });
     }
 
-    const group = await TiffinGroup.create({
+    const group = new TiffinGroup({
       name: name.trim(),
       defaultPrice: price,
       pricePerTiffin: price,
-      inviteCode,
       createdBy: userId,
       members: initialMembers,
     });
+    group.inviteCode = getStaticGroupCode(group);
+    await group.save();
 
     return res.status(201).json(group);
   } catch (err) {
@@ -143,9 +162,9 @@ router.get('/groups/:id', auth, async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    if (!group.inviteCode) {
-      group.inviteCode = generate4DigitCode();
-      await group.save();
+    if (!group.inviteCode || !/^\d{4}$/.test(String(group.inviteCode))) {
+      group.inviteCode = getStaticGroupCode(group);
+      await group.save().catch(() => {});
     }
 
     // Month filtering & auto-reset on 1st of month
@@ -452,10 +471,21 @@ router.post('/join/code', auth, async (req, res) => {
       return res.status(400).json({ message: 'Enter a valid 4-digit code' });
     }
 
-    const group = await TiffinGroup.findOne({
-      inviteCode: code.trim(),
+    const cleanCode = code.trim();
+    let group = await TiffinGroup.findOne({
+      inviteCode: cleanCode,
       archived: { $ne: true },
     });
+
+    if (!group) {
+      // Also check against deterministic static codes across active groups
+      const allGroups = await TiffinGroup.find({ archived: { $ne: true } });
+      group = allGroups.find((g) => getStaticGroupCode(g) === cleanCode);
+      if (group) {
+        group.inviteCode = cleanCode;
+        await group.save().catch(() => {});
+      }
+    }
 
     if (!group) {
       return res.status(404).json({ message: 'Invalid or expired tiffin code.' });
@@ -485,15 +515,17 @@ router.post('/join/code', auth, async (req, res) => {
   }
 });
 
-// POST /api/tiffin/groups/:id/invite — regenerate 4-digit invite code
+// POST /api/tiffin/groups/:id/invite — return static 4-digit invite code
 router.post('/groups/:id/invite', auth, async (req, res) => {
   try {
     const groupId = req.params.id;
     const group = await TiffinGroup.findById(groupId);
     if (!group) return res.status(404).json({ message: 'Group not found' });
 
-    group.inviteCode = generate4DigitCode();
-    await group.save();
+    if (!group.inviteCode || !/^\d{4}$/.test(String(group.inviteCode))) {
+      group.inviteCode = getStaticGroupCode(group);
+      await group.save().catch(() => {});
+    }
 
     return res.json({ inviteCode: group.inviteCode });
   } catch (err) {
