@@ -3,6 +3,9 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const SplitGroup = require('../models/SplitGroup');
 const SplitExpense = require('../models/SplitExpense');
+const User = require('../models/User');
+const Category = require('../models/Category');
+const Expense = require('../models/Expense');
 
 // GET /api/split/summary
 router.get('/summary', auth, async (req, res) => {
@@ -108,6 +111,41 @@ router.post('/groups/:id/expenses', auth, async (req, res) => {
       splitBetween,
       date: date ? new Date(date) : new Date(),
     });
+
+    // Auto-sync into Expense Tracker if participant has autoSyncSplit enabled
+    try {
+      for (const split of splitBetween) {
+        if (split.userId && split.amount > 0) {
+          const targetUser = await User.findById(split.userId);
+          if (targetUser && targetUser.autoSyncSplit) {
+            let splitCat = await Category.findOne({ userId: targetUser._id, name: 'Split Expense' });
+            if (!splitCat) {
+              splitCat = await Category.create({
+                userId: targetUser._id,
+                name: 'Split Expense',
+                limit: 5000,
+                color: '#8b5cf6',
+                icon: 'people-outline',
+                isDefault: false,
+              });
+            }
+
+            await Expense.create({
+              userId: targetUser._id,
+              title: `Split: ${description} (${group.name})`,
+              amount: split.amount,
+              category: 'Split Expense',
+              categoryId: splitCat._id,
+              date: expense.date || new Date(),
+              paymentMethod: String(expense.paidBy) === String(targetUser._id) ? 'Paid by You' : 'Split Share',
+              notes: `Auto-synced from Split Bills: ${group.name}`,
+            });
+          }
+        }
+      }
+    } catch (syncErr) {
+      console.error('Split auto-sync to expenses error:', syncErr);
+    }
 
     return res.status(201).json(expense);
   } catch (err) {

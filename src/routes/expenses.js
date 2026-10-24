@@ -5,11 +5,16 @@ const Expense = require('../models/Expense');
 const Budget = require('../models/Budget');
 const Category = require('../models/Category');
 
+const { autoProcessRecurringExpenses } = require('./recurring');
+
 // GET /api/expenses
 router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { category, search, limit, sortBy, sortOrder } = req.query;
+    if (typeof autoProcessRecurringExpenses === 'function') {
+      await autoProcessRecurringExpenses(userId);
+    }
+    const { category, search, limit, sortBy, sortOrder, month } = req.query;
 
     const query = { userId };
     if (category && category !== 'All') {
@@ -17,6 +22,15 @@ router.get('/', auth, async (req, res) => {
     }
     if (search) {
       query.title = { $regex: search, $options: 'i' };
+    }
+    if (month && month !== 'all') {
+      const [year, m] = month.split('-').map(Number);
+      if (year && m) {
+        // Broad UTC/Local range to ensure all transactions in that month are returned
+        const startOfMonth = new Date(Date.UTC(year, m - 1, 1, 0, 0, 0, 0));
+        const endOfMonth = new Date(Date.UTC(year, m, 1, 0, 0, 0, 0)); // Start of next month
+        query.date = { $gte: startOfMonth, $lt: endOfMonth };
+      }
     }
 
     const sortField = sortBy || 'date';

@@ -12,6 +12,8 @@ const userSchema = new mongoose.Schema(
     otp: { type: String, default: null },
     otpExpiry: { type: Date, default: null },
     currency: { type: String, default: 'INR' },
+    autoSyncTiffin: { type: Boolean, default: false },
+    autoSyncSplit: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

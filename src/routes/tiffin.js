@@ -4,6 +4,9 @@ const mongoose = require('mongoose');
 const auth = require('../middleware/auth');
 const TiffinGroup = require('../models/TiffinGroup');
 const TiffinEntry = require('../models/TiffinEntry');
+const User = require('../models/User');
+const Category = require('../models/Category');
+const Expense = require('../models/Expense');
 
 // Helper to generate static, unique 4-digit code per group
 const getStaticGroupCode = (groupOrId) => {
@@ -359,6 +362,53 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
       participants: Array.isArray(participants) ? participants : [],
       notes: isNoMeal ? (notes || 'No one took tiffin today') : (notes || ''),
     });
+
+    // Auto-sync into Expense Tracker if user or member has autoSyncTiffin enabled
+    if (!isNoMeal && entry.memberBills) {
+      try {
+        for (const m of group.members) {
+          const mId = String(m._id || m.userId);
+          const due = memberBills[mId] || 0;
+          if (due > 0) {
+            let targetUser = null;
+            if (m.userId) {
+              targetUser = await User.findById(m.userId);
+            } else if (m.email) {
+              targetUser = await User.findOne({ email: m.email.toLowerCase().trim() });
+            } else if (String(group.createdBy) === userId && m.name && req.user && req.user.name && m.name.toLowerCase() === req.user.name.toLowerCase()) {
+              targetUser = await User.findById(userId);
+            }
+
+            if (targetUser && targetUser.autoSyncTiffin) {
+              let tiffinCat = await Category.findOne({ userId: targetUser._id, name: 'Tiffin Expense' });
+              if (!tiffinCat) {
+                tiffinCat = await Category.create({
+                  userId: targetUser._id,
+                  name: 'Tiffin Expense',
+                  limit: 5000,
+                  color: '#ea580c',
+                  icon: 'restaurant-outline',
+                  isDefault: false,
+                });
+              }
+
+              await Expense.create({
+                userId: targetUser._id,
+                title: `Tiffin: ${normalizedMeal.charAt(0).toUpperCase() + normalizedMeal.slice(1)} (${group.name})`,
+                amount: due,
+                category: 'Tiffin Expense',
+                categoryId: tiffinCat._id,
+                date: entry.date || new Date(),
+                paymentMethod: 'UPI',
+                notes: `Auto-synced from Tiffin Tracker: ${group.name}`,
+              });
+            }
+          }
+        }
+      } catch (syncErr) {
+        console.error('Tiffin auto-sync to expenses error:', syncErr);
+      }
+    }
 
     return res.status(201).json(entry);
   } catch (err) {

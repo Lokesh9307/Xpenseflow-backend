@@ -57,4 +57,72 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
+// PUT /api/categories/:id
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { name, limit, monthlyLimit, warningThreshold, criticalThreshold, color, icon } = req.body;
+
+    let category = null;
+    if (id && id.length === 24) {
+      category = await Category.findOneAndUpdate(
+        { _id: id, userId },
+        {
+          ...(name && { name }),
+          ...((limit || monthlyLimit) && { limit: limit || monthlyLimit }),
+          ...(warningThreshold && { warningThreshold }),
+          ...(criticalThreshold && { criticalThreshold }),
+          ...(color && { color }),
+          ...(icon && { icon }),
+        },
+        { new: true }
+      );
+    }
+
+    if (!category) {
+      category = await Category.findOneAndUpdate(
+        { name: req.body.previousName || name, userId },
+        {
+          ...(name && { name }),
+          ...((limit || monthlyLimit) && { limit: limit || monthlyLimit }),
+          ...(color && { color }),
+          ...(icon && { icon }),
+        },
+        { new: true }
+      );
+    }
+
+    if (!category) {
+      category = await Category.create({
+        userId,
+        name,
+        limit: limit || monthlyLimit || 5000,
+        color: color || '#0D9488',
+        icon: icon || 'Food & Dining',
+      });
+    }
+
+    return res.json(category);
+  } catch (err) {
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// DELETE /api/categories/:id
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    if (id && id.length === 24) {
+      await Category.findOneAndDelete({ _id: id, userId });
+    } else {
+      await Category.findOneAndDelete({ name: id, userId });
+    }
+    return res.json({ success: true, message: 'Category deleted' });
+  } catch (err) {
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
 module.exports = router;
