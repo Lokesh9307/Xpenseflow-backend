@@ -299,12 +299,32 @@ router.get('/groups/:id', auth, async (req, res) => {
   }
 });
 
+// GET /api/tiffin/groups/:id/entries — get entries for a group
+router.get('/groups/:id/entries', auth, async (req, res) => {
+  try {
+    const groupId = req.params.id;
+    const { month } = req.query;
+    let query = { groupId };
+    if (month && /^\d{4}-\d{2}$/.test(month)) {
+      const [year, m] = month.split('-').map(Number);
+      const start = new Date(year, m - 1, 1);
+      const end = new Date(year, m, 1);
+      query.date = { $gte: start, $lt: end };
+    }
+    const entries = await TiffinEntry.find(query).sort({ date: -1, createdAt: -1 });
+    return res.json(entries);
+  } catch (err) {
+    console.error('GET /api/tiffin/groups/:id/entries error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
 // POST /api/tiffin/groups/:id/entries — create a meal entry or "no tiffin today"
 router.post('/groups/:id/entries', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const groupId = req.params.id;
-    const { mealType, count, quantity, baseQuantity, splitMemberIds, extras, extraPrice, notes, date, noTiffin, participants } = req.body;
+    const { mealType, count, quantity, baseQuantity, splitMemberIds, extras, extraPrice, notes, date, noTiffin, participants, memberBills: clientMemberBills } = req.body;
 
     const group = await TiffinGroup.findById(groupId);
     if (!group) return res.status(404).json({ message: 'Group not found' });
@@ -325,23 +345,33 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
         : (parseInt(quantity || count, 10) || 1);
 
       splitIds = Array.isArray(splitMemberIds) && splitMemberIds.length > 0
-        ? splitMemberIds
-        : group.members.map((m) => String(m._id || m.userId));
+        ? splitMemberIds.map(String)
+        : group.members.map((m, idx) => String(m._id || m.userId || idx));
 
       const extraTiffinsTotal = Object.values(extrasMap).reduce((s, k) => s + (parseInt(k, 10) || 0), 0);
       mealCount = baseQty + extraTiffinsTotal;
       const extraVal = parseFloat(extraPrice) || 0;
       totalPrice = (baseQty * pricePerUnit) + (extraTiffinsTotal * pricePerUnit) + extraVal;
 
-      // Calculate member bills (base shared evenly + extra tiffins at full price)
+      // Calculate member bills (support client passed bills or derive evenly)
       const basePerPerson = splitIds.length > 0 ? (baseQty * pricePerUnit) / splitIds.length : 0;
-      group.members.forEach((m) => {
+      group.members.forEach((m, idx) => {
         const mId = String(m._id || m.userId);
-        let bill = splitIds.includes(mId) ? basePerPerson : 0;
-        if (extrasMap[mId]) {
-          bill += (parseInt(extrasMap[mId], 10) || 0) * pricePerUnit;
+        const idxStr = String(idx);
+        let bill = 0;
+
+        if (clientMemberBills && (clientMemberBills[mId] !== undefined || clientMemberBills[idxStr] !== undefined)) {
+          bill = parseFloat(clientMemberBills[mId] ?? clientMemberBills[idxStr]) || 0;
+        } else {
+          const isParticipant = splitIds.includes(mId) || splitIds.includes(idxStr) || splitIds.includes(String(m.userId)) || splitIds.includes(String(m._id));
+          bill = isParticipant ? basePerPerson : 0;
+          const userExtra = extrasMap[mId] ?? extrasMap[idxStr] ?? 0;
+          if (userExtra) {
+            bill += (parseInt(userExtra, 10) || 0) * pricePerUnit;
+          }
         }
         memberBills[mId] = Math.round(bill * 100) / 100;
+        memberBills[idxStr] = Math.round(bill * 100) / 100;
       });
     }
 
@@ -366,16 +396,19 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
     // Auto-sync into Expense Tracker if user or member has autoSyncTiffin enabled
     if (!isNoMeal && entry.memberBills) {
       try {
-        for (const m of group.members) {
+        for (let idx = 0; idx < group.members.length; idx++) {
+          const m = group.members[idx];
           const mId = String(m._id || m.userId);
-          const due = memberBills[mId] || 0;
+          const idxStr = String(idx);
+          const due = memberBills[mId] ?? memberBills[idxStr] ?? 0;
           if (due > 0) {
             let targetUser = null;
             if (m.userId) {
               targetUser = await User.findById(m.userId);
             } else if (m.email) {
               targetUser = await User.findOne({ email: m.email.toLowerCase().trim() });
-            } else if (String(group.createdBy) === userId && m.name && req.user && req.user.name && m.name.toLowerCase() === req.user.name.toLowerCase()) {
+            }
+            if (!targetUser && (String(group.createdBy) === userId || String(m.name || '').toLowerCase() === 'you' || String(m.name || '').toLowerCase() === 'me' || idx === 0)) {
               targetUser = await User.findById(userId);
             }
 
@@ -392,16 +425,23 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
                 });
               }
 
-              await Expense.create({
-                userId: targetUser._id,
-                title: `Tiffin: ${normalizedMeal.charAt(0).toUpperCase() + normalizedMeal.slice(1)} (${group.name})`,
-                amount: due,
-                category: 'Tiffin Expense',
-                categoryId: tiffinCat._id,
-                date: entry.date || new Date(),
-                paymentMethod: 'UPI',
-                notes: `Auto-synced from Tiffin Tracker: ${group.name}`,
-              });
+              const syncRef = `tiffin_${entry._id}_${groupId}`;
+              await Expense.findOneAndUpdate(
+                { syncRefId: syncRef },
+                {
+                  userId: targetUser._id,
+                  title: `Tiffin: ${normalizedMeal.charAt(0).toUpperCase() + normalizedMeal.slice(1)} (${group.name})`,
+                  amount: due,
+                  category: 'Tiffin Expense',
+                  categoryId: tiffinCat._id,
+                  date: entry.date || new Date(),
+                  paymentMethod: 'UPI',
+                  notes: `Group: ${group.name} · ${entry.quantity || 1} meal(s)${entry.notes ? ` · ${entry.notes}` : ''}`,
+                  syncSource: 'tiffin',
+                  syncRefId: syncRef,
+                },
+                { upsert: true, new: true }
+              );
             }
           }
         }
@@ -504,6 +544,13 @@ router.delete('/groups/:id/entries/:entryId', auth, async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({ message: 'Entry not found' });
     }
+    // Clean up synced Expense from Expense Tracker
+    await Expense.deleteMany({
+      $or: [
+        { syncRefId: `tiffin_${entryId}_${groupId}` },
+        { syncRefId: `tiffin_${entryId}` },
+      ],
+    }).catch(() => {});
     return res.json({ message: 'Entry deleted' });
   } catch (err) {
     console.error('DELETE /api/tiffin/entries error:', err);
