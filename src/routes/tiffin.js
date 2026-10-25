@@ -23,13 +23,98 @@ const getStaticGroupCode = (groupOrId) => {
   return String(Math.abs(hash) % 9000 + 1000);
 };
 
+// Helper to calculate exact per-person bills from any entry (supporting web shared-split & legacy)
+function calculateEntryBills(entry, pricePerUnit, groupMembers = []) {
+  const price = Number(entry.pricePerTiffin || entry.price || pricePerUnit || 100);
+  const bills = {};
+
+  // 1. If explicit memberBills is populated
+  if (entry.memberBills && Object.keys(entry.memberBills).length > 0) {
+    Object.entries(entry.memberBills).forEach(([id, amt]) => {
+      const val = typeof amt === 'object' && amt !== null ? (amt.total ?? amt.amount ?? amt.base) : amt;
+      const num = parseFloat(val) || 0;
+      bills[String(id)] = Math.round(num * 100) / 100;
+    });
+    return bills;
+  }
+
+  // 2. Web shared-split model: baseQuantity > 0 and participantMemberIds
+  const baseQty = Math.floor(Number(entry.baseQuantity) || 0);
+  const participantIds = Array.isArray(entry.participantMemberIds) && entry.participantMemberIds.length > 0
+    ? entry.participantMemberIds.map(String)
+    : (Array.isArray(entry.splitMemberIds) && entry.splitMemberIds.length > 0 ? entry.splitMemberIds.map(String) : []);
+
+  if (baseQty > 0 && participantIds.length > 0) {
+    const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
+    const baseShare = Math.round(((baseQty * price) / uniqueParticipants.length) * 100) / 100;
+    const extrasMap = entry.participantQuantities || entry.extras || {};
+
+    uniqueParticipants.forEach((pid) => {
+      bills[pid] = (bills[pid] || 0) + baseShare;
+    });
+
+    Object.entries(extrasMap).forEach(([pid, k]) => {
+      const extraCount = Math.max(0, Math.floor(Number(k) || 0));
+      if (extraCount > 0) {
+        bills[String(pid)] = Math.round(((bills[String(pid)] || 0) + extraCount * price) * 100) / 100;
+      }
+    });
+
+    return bills;
+  }
+
+  // 3. Web per-participant quantities / participantMemberIds
+  if (participantIds.length > 0) {
+    const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
+    const extrasMap = entry.participantQuantities || entry.extras || {};
+    uniqueParticipants.forEach((pid) => {
+      const count = Math.max(1, Math.floor(Number(extrasMap[pid]) || 1));
+      bills[pid] = Math.round(count * price * 100) / 100;
+    });
+    return bills;
+  }
+
+  // 4. Participants array format
+  if (Array.isArray(entry.participants) && entry.participants.length > 0) {
+    const total = Number(entry.totalCost ?? entry.totalPrice ?? (price * entry.participants.length));
+    const share = Math.round((total / entry.participants.length) * 100) / 100;
+    entry.participants.forEach((p) => {
+      const pId = String(p.memberId || p._id || p.userId);
+      bills[pId] = share;
+    });
+    return bills;
+  }
+
+  // 5. Fallback: split totalCost / totalPrice equally across all group members
+  const total = Number(entry.totalCost ?? entry.totalPrice ?? (price * (entry.quantity || entry.count || 1)));
+  if (Array.isArray(groupMembers) && groupMembers.length > 0) {
+    const splitShare = Math.round((total / groupMembers.length) * 100) / 100;
+    groupMembers.forEach((m) => {
+      const mId = String(m._id || m.userId);
+      bills[mId] = splitShare;
+    });
+    return bills;
+  }
+
+  // 6. Single-user fallback
+  const fallbackId = String(entry.userId || entry.addedBy || '0');
+  bills[fallbackId] = total;
+  return bills;
+}
+
 // GET /api/tiffin/groups — list all groups user is member of or created
 router.get('/groups', auth, async (req, res) => {
   try {
     const userId = req.user.id;
+    const userEmail = req.user.email ? req.user.email.toLowerCase().trim() : '';
+
     const groups = await TiffinGroup.find({
       archived: { $ne: true },
-      $or: [{ createdBy: userId }, { 'members.userId': userId }],
+      $or: [
+        { createdBy: userId },
+        { 'members.userId': userId },
+        ...(userEmail ? [{ 'members.email': userEmail }] : []),
+      ],
     }).sort({ updatedAt: -1 });
 
     // Enhance each group with active cycle spend and entry count
@@ -43,9 +128,12 @@ router.get('/groups', auth, async (req, res) => {
         }
 
         const entries = await TiffinEntry.find({ groupId: group._id });
-        const cycleTotal = entries.reduce((s, e) => s + (e.totalPrice || 0), 0);
-        const cycleQuantity = entries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
-        const price = group.defaultPrice || group.pricePerTiffin || 80;
+        const price = Number(group.pricePerTiffin || group.defaultPrice || 100);
+        const cycleTotal = entries.reduce(
+          (s, e) => s + (e.totalCost ?? e.totalPrice ?? ((e.quantity ?? e.count ?? 1) * price)),
+          0
+        );
+        const cycleQuantity = entries.reduce((s, e) => s + (e.quantity ?? e.count ?? (e.noTiffin ? 0 : 1)), 0);
         return {
           ...group.toObject(),
           defaultPrice: price,
@@ -57,6 +145,7 @@ router.get('/groups', auth, async (req, res) => {
         };
       })
     );
+
 
     return res.json(enhancedGroups);
   } catch (err) {
@@ -75,7 +164,7 @@ router.post('/groups', auth, async (req, res) => {
       return res.status(400).json({ message: 'Tiffin group name required' });
     }
 
-    const price = Number(defaultPrice || pricePerTiffin || 80);
+    const price = Number(pricePerTiffin || defaultPrice || 100);
 
     const initialMembers = [
       { userId, name: req.user.name || 'Admin', email: req.user.email || '' },
@@ -132,10 +221,11 @@ router.patch('/groups/:id', auth, async (req, res) => {
       group.name = name.trim();
     }
     if (defaultPrice !== undefined || pricePerTiffin !== undefined) {
-      const price = parseFloat(defaultPrice ?? pricePerTiffin) || 80;
+      const price = parseFloat(pricePerTiffin ?? defaultPrice) || 100;
       group.defaultPrice = price;
       group.pricePerTiffin = price;
     }
+
 
     await group.save();
     return res.json(group);
@@ -210,14 +300,28 @@ router.get('/groups/:id', auth, async (req, res) => {
       return d >= monthStart && d < monthEnd;
     });
 
-    const monthTotal = monthEntries.reduce((s, e) => s + (e.totalPrice || 0), 0);
-    const monthQuantity = monthEntries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
+    const pricePerUnit = Number(group.pricePerTiffin || group.defaultPrice || 100);
+
+    const monthTotal = monthEntries.reduce(
+      (s, e) => s + (e.totalCost ?? e.totalPrice ?? ((e.quantity ?? e.count ?? 1) * pricePerUnit)),
+      0
+    );
+    const monthQuantity = monthEntries.reduce(
+      (s, e) => s + (e.quantity ?? e.count ?? (e.noTiffin ? 0 : 1)),
+      0
+    );
 
     // Lifetime totals
-    const cycleTotal = entries.reduce((s, e) => s + (e.totalPrice || 0), 0);
-    const cycleQuantity = entries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
+    const cycleTotal = entries.reduce(
+      (s, e) => s + (e.totalCost ?? e.totalPrice ?? ((e.quantity ?? e.count ?? 1) * pricePerUnit)),
+      0
+    );
+    const cycleQuantity = entries.reduce(
+      (s, e) => s + (e.quantity ?? e.count ?? (e.noTiffin ? 0 : 1)),
+      0
+    );
 
-    // Compute detailed member stats for the selected month
+    // Compute detailed member stats for the selected month using web-compatible split math
     const memberTotals = {};
     const memberStats = {};
     group.members.forEach((m) => {
@@ -237,44 +341,37 @@ router.get('/groups/:id', auth, async (req, res) => {
 
     monthEntries.forEach((e) => {
       if (e.noTiffin || e.mealType === 'none') return;
-      const pricePerUnit = group.pricePerTiffin || group.defaultPrice || 80;
+      const entryPrice = Number(e.pricePerTiffin || pricePerUnit);
+      const bills = calculateEntryBills(e, entryPrice, group.members);
 
-      if (e.memberBills && Object.keys(e.memberBills).length > 0) {
-        Object.entries(e.memberBills).forEach(([id, amt]) => {
-          const due = parseFloat(amt) || 0;
-          memberTotals[id] = (memberTotals[id] || 0) + due;
-          if (memberStats[id]) {
-            const extraCount = (e.extras && e.extras[id]) ? parseInt(e.extras[id], 10) || 0 : 0;
-            const extraAmt = extraCount * pricePerUnit;
+      group.members.forEach((m, idx) => {
+        const mId = String(m._id || m.userId);
+        const mUserId = m.userId ? String(m.userId) : '';
+        const idxStr = String(idx);
+
+        let due = 0;
+        if (bills[mId] !== undefined) due = bills[mId];
+        else if (mUserId && bills[mUserId] !== undefined) due = bills[mUserId];
+        else if (bills[idxStr] !== undefined) due = bills[idxStr];
+
+        if (due > 0) {
+          memberTotals[mId] = Math.round(((memberTotals[mId] || 0) + due) * 100) / 100;
+          if (memberStats[mId]) {
+            const extrasMap = e.participantQuantities || e.extras || {};
+            const extraCount = parseInt(extrasMap[mId] ?? (mUserId ? extrasMap[mUserId] : undefined) ?? extrasMap[idxStr] ?? 0, 10) || 0;
+            const extraAmt = extraCount * entryPrice;
             const baseAmt = Math.max(0, due - extraAmt);
-            memberStats[id].totalDue += due;
-            memberStats[id].extraTiffins += extraCount;
-            memberStats[id].extraTotal += extraAmt;
-            memberStats[id].baseTotal += baseAmt;
-            if (due > 0) memberStats[id].mealsCount += 1;
+
+            memberStats[mId].totalDue = Math.round((memberStats[mId].totalDue + due) * 100) / 100;
+            memberStats[mId].extraTiffins += extraCount;
+            memberStats[mId].extraTotal = Math.round((memberStats[mId].extraTotal + extraAmt) * 100) / 100;
+            memberStats[mId].baseTotal = Math.round((memberStats[mId].baseTotal + baseAmt) * 100) / 100;
+            memberStats[mId].mealsCount += 1;
           }
-        });
-      } else if (Array.isArray(e.participants) && e.participants.length > 0) {
-        const share = (e.totalPrice || 0) / e.participants.length;
-        e.participants.forEach((p) => {
-          const id = String(p.memberId);
-          memberTotals[id] = (memberTotals[id] || 0) + share;
-          if (memberStats[id]) {
-            memberStats[id].totalDue += share;
-            memberStats[id].baseTotal += share;
-            memberStats[id].mealsCount += 1;
-          }
-        });
-      } else {
-        const id = String(e.userId);
-        memberTotals[id] = (memberTotals[id] || 0) + (e.totalPrice || 0);
-        if (memberStats[id]) {
-          memberStats[id].totalDue += (e.totalPrice || 0);
-          memberStats[id].baseTotal += (e.totalPrice || 0);
-          memberStats[id].mealsCount += 1;
         }
-      }
+      });
     });
+
 
     return res.json({
       group,
@@ -333,7 +430,7 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
 
     const isNoMeal = noTiffin === true || mealType === 'none' || count === 0 || quantity === 0;
     const normalizedMeal = isNoMeal ? 'none' : (mealType || 'lunch').toLowerCase();
-    const pricePerUnit = group.defaultPrice || group.pricePerTiffin || 80;
+    const pricePerUnit = Number(group.pricePerTiffin || group.defaultPrice || 100);
 
     let mealCount = 0;
     let totalPrice = 0;
@@ -385,11 +482,14 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
       count: mealCount,
       quantity: mealCount,
       baseQuantity: isNoMeal ? 0 : (baseQuantity || mealCount),
+      pricePerTiffin: pricePerUnit,
+      totalCost: totalPrice,
+      totalPrice,
+      participantMemberIds: splitIds,
       splitMemberIds: splitIds,
       extras: extrasMap,
       memberBills,
       extraPrice: isNoMeal ? 0 : (parseFloat(extraPrice) || 0),
-      totalPrice,
       noTiffin: isNoMeal,
       participants: Array.isArray(participants) ? participants : [],
       notes: isNoMeal ? (notes || 'No one took tiffin today') : (notes || ''),
@@ -410,8 +510,10 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
             } else if (m.email) {
               targetUser = await User.findOne({ email: m.email.toLowerCase().trim() });
             }
-            if (!targetUser && (String(group.createdBy) === userId || String(m.name || '').toLowerCase() === 'you' || String(m.name || '').toLowerCase() === 'me' || idx === 0)) {
-              targetUser = await User.findById(userId);
+            const isCreatorMember = (m.userId && String(m.userId) === String(group.createdBy)) ||
+              (!m.userId && (String(m.name || '').toLowerCase() === 'you' || String(m.name || '').toLowerCase() === 'me' || idx === 0));
+            if (!targetUser && isCreatorMember) {
+              targetUser = await User.findById(group.createdBy);
             }
 
             if (targetUser && targetUser.autoSyncTiffin) {
@@ -427,7 +529,7 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
                 });
               }
 
-              const syncRef = `tiffin_${entry._id}_${groupId}`;
+              const syncRef = `tiffin_${entry._id}_${groupId}_${mId}`;
               await Expense.findOneAndUpdate(
                 { syncRefId: syncRef },
                 {
@@ -438,7 +540,7 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
                   categoryId: tiffinCat._id,
                   date: entry.date || new Date(),
                   paymentMethod: 'UPI',
-                  notes: `Group: ${group.name} · ${entry.quantity || 1} meal(s)${entry.notes ? ` · ${entry.notes}` : ''}`,
+                  notes: `Group: ${group.name} · Share: ₹${due}${entry.notes ? ` · ${entry.notes}` : ''}`,
                   syncSource: 'tiffin',
                   syncRefId: syncRef,
                 },
@@ -451,6 +553,7 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
         console.error('Tiffin auto-sync to expenses error:', syncErr);
       }
     }
+
 
     return res.status(201).json(entry);
   } catch (err) {

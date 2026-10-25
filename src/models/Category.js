@@ -4,7 +4,8 @@ const categorySchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     name: { type: String, required: true },
-    limit: { type: Number, required: true, default: 5000 },
+    monthlyLimit: { type: Number },
+    limit: { type: Number, default: 5000 },
     warningThreshold: { type: Number, default: 80 },
     criticalThreshold: { type: Number, default: 95 },
     color: { type: String, default: '#A78BFA' },
@@ -15,3 +16,4 @@ const categorySchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.models.Category || mongoose.model('Category', categorySchema);
+

@@ -18,7 +18,19 @@ router.get('/', auth, async (req, res) => {
 
     const query = { userId };
     if (category && category !== 'All') {
-      query.category = category;
+      const trimmedCat = category.trim();
+      const catDoc = await Category.findOne({
+        userId,
+        name: { $regex: new RegExp(`^${trimmedCat}$`, 'i') },
+      });
+      if (catDoc) {
+        query.$or = [
+          { category: { $regex: new RegExp(`^${trimmedCat}$`, 'i') } },
+          { categoryId: catDoc._id },
+        ];
+      } else {
+        query.category = { $regex: new RegExp(`^${trimmedCat}$`, 'i') };
+      }
     }
     if (search) {
       query.title = { $regex: search, $options: 'i' };
@@ -35,11 +47,29 @@ router.get('/', auth, async (req, res) => {
 
     const sortField = sortBy || 'date';
     const sortDir = sortOrder === 'asc' ? 1 : -1;
-    const maxLimit = limit ? parseInt(limit, 10) : 100;
+    const maxLimit = limit ? parseInt(limit, 10) : 150;
 
-    const expenses = await Expense.find(query)
+    const rawExpenses = await Expense.find(query)
+      .populate('categoryId', 'name color icon monthlyLimit limit')
       .sort({ [sortField]: sortDir })
       .limit(maxLimit);
+
+    // Normalize expenses so web and mobile receive their expected fields without category loss
+    const expenses = rawExpenses.map((exp) => {
+      const obj = exp.toObject ? exp.toObject() : exp;
+      let catName = obj.category;
+      if (!catName || catName === 'Others') {
+        if (obj.categoryId && typeof obj.categoryId === 'object' && obj.categoryId.name) {
+          catName = obj.categoryId.name;
+        }
+      }
+      return {
+        ...obj,
+        category: catName || 'Others',
+        categoryId: obj.categoryId?._id || obj.categoryId,
+        categoryDetails: obj.categoryId && typeof obj.categoryId === 'object' ? obj.categoryId : undefined,
+      };
+    });
 
     return res.json(expenses);
   } catch (err) {
@@ -52,7 +82,7 @@ router.get('/', auth, async (req, res) => {
 router.post('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { title, amount, category, paymentMethod, date, notes, location } = req.body;
+    const { title, amount, category, categoryId, paymentMethod, date, notes, location } = req.body;
 
     if (!title || !amount) {
       return res.status(400).json({ message: 'Title and amount are required' });
@@ -60,11 +90,42 @@ router.post('/', auth, async (req, res) => {
 
     const expenseDate = date ? new Date(date) : new Date();
 
+    // Resolve categoryId and category name to guarantee full web & mobile schema compatibility
+    let resolvedCategoryId = categoryId;
+    let resolvedCategoryName = category;
+
+    if (resolvedCategoryId) {
+      const catDoc = await Category.findById(resolvedCategoryId);
+      if (catDoc) {
+        resolvedCategoryName = catDoc.name;
+      }
+    } else if (resolvedCategoryName) {
+      let catDoc = await Category.findOne({
+        userId,
+        name: { $regex: new RegExp(`^${resolvedCategoryName.trim()}$`, 'i') },
+      });
+      if (!catDoc) {
+        catDoc = await Category.create({
+          userId,
+          name: resolvedCategoryName.trim(),
+          limit: 5000,
+          monthlyLimit: 5000,
+          color: '#0D9488',
+          icon: 'LayoutGrid',
+        });
+      }
+      resolvedCategoryId = catDoc._id;
+      resolvedCategoryName = catDoc.name;
+    } else {
+      resolvedCategoryName = 'Others';
+    }
+
     const expense = await Expense.create({
       userId,
       title,
       amount: parseFloat(amount),
-      category: category || 'Others',
+      categoryId: resolvedCategoryId,
+      category: resolvedCategoryName,
       paymentMethod: paymentMethod || 'UPI',
       date: expenseDate,
       notes: notes || '',
@@ -73,11 +134,10 @@ router.post('/', auth, async (req, res) => {
 
     // Update budget if matching category exists
     const month = `${expenseDate.getFullYear()}-${String(expenseDate.getMonth() + 1).padStart(2, '0')}`;
-    const cat = await Category.findOne({ userId, name: expense.category });
-    if (cat) {
+    if (resolvedCategoryId) {
       await Budget.findOneAndUpdate(
-        { userId, categoryId: cat._id, month },
-        { $inc: { spent: expense.amount }, $setOnInsert: { limit: cat.limit } },
+        { userId, categoryId: resolvedCategoryId, month },
+        { $inc: { spent: expense.amount }, $setOnInsert: { limit: 5000 } },
         { upsert: true }
       );
     }
@@ -88,6 +148,7 @@ router.post('/', auth, async (req, res) => {
     return res.status(500).json({ message: err.message || 'Server error' });
   }
 });
+
 
 // PUT /api/expenses/:id
 router.put('/:id', auth, async (req, res) => {
