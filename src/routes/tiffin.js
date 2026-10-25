@@ -45,9 +45,11 @@ router.get('/groups', auth, async (req, res) => {
         const entries = await TiffinEntry.find({ groupId: group._id });
         const cycleTotal = entries.reduce((s, e) => s + (e.totalPrice || 0), 0);
         const cycleQuantity = entries.reduce((s, e) => s + (e.quantity ?? e.count ?? 0), 0);
+        const price = group.defaultPrice || group.pricePerTiffin || 80;
         return {
           ...group.toObject(),
-          pricePerTiffin: group.defaultPrice || group.pricePerTiffin || 80,
+          defaultPrice: price,
+          pricePerTiffin: price,
           cycleTotal,
           cycleQuantity,
           entryCount: entries.length,

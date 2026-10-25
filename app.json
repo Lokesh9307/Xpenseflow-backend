@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "009219be-3d91-44bc-a53a-16999dd53056"
+      }
+    },
+    "android": {
+      "package": "com.lokesh2003.xpenseflowmobilebackend"
+    }
+  }
+}

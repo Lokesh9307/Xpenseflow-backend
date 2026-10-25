@@ -105,6 +105,19 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
+// DELETE /api/expenses/reset — delete all expenses and reset budgets for user
+router.delete('/reset', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await Expense.deleteMany({ userId });
+    await Budget.deleteMany({ userId });
+    return res.json({ success: true, message: 'All expenses and budgets have been reset successfully' });
+  } catch (err) {
+    console.error('Reset expenses error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
 // DELETE /api/expenses/:id
 router.delete('/:id', auth, async (req, res) => {
   try {
