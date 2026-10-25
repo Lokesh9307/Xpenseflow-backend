@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/auth');
 const Category = require('../models/Category');
+const { invalidateUserCategoryCache } = require('../agent/categoryResolver');
 
 // GET /api/categories
 router.get('/', auth, async (req, res) => {
@@ -51,6 +52,7 @@ router.post('/', auth, async (req, res) => {
       icon: icon || 'fast-food-outline',
     });
 
+    invalidateUserCategoryCache(userId);
     return res.status(201).json(category);
   } catch (err) {
     return res.status(500).json({ message: err.message || 'Server error' });
@@ -103,6 +105,7 @@ router.put('/:id', auth, async (req, res) => {
       });
     }
 
+    invalidateUserCategoryCache(userId);
     return res.json(category);
   } catch (err) {
     return res.status(500).json({ message: err.message || 'Server error' });
@@ -119,6 +122,7 @@ router.delete('/:id', auth, async (req, res) => {
     } else {
       await Category.findOneAndDelete({ name: id, userId });
     }
+    invalidateUserCategoryCache(userId);
     return res.json({ success: true, message: 'Category deleted' });
   } catch (err) {
     return res.status(500).json({ message: err.message || 'Server error' });

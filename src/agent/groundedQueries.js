@@ -16,10 +16,30 @@ const SplitGroup = require('../models/SplitGroup');
 const TiffinEntry = require('../models/TiffinEntry');
 const TiffinGroup = require('../models/TiffinGroup');
 
+// High-speed in-memory RAM cache for repeated financial read queries (30s TTL)
+const queryCache = new Map();
+const QUERY_CACHE_TTL_MS = 30 * 1000;
+
+function invalidateUserQueryCache(userId) {
+  if (!userId) return;
+  const prefix = String(userId) + ':';
+  for (const key of queryCache.keys()) {
+    if (key.startsWith(prefix)) {
+      queryCache.delete(key);
+    }
+  }
+}
+
 /**
  * Deterministic calculation of expense totals, counts, and category breakdowns.
  */
 async function queryExpensesSummary({ userId, category, month, search, startDate, endDate, limit = 100 }) {
+  const cacheKey = `${userId}:exp:${category || ''}:${month || ''}:${search || ''}:${startDate || ''}:${endDate || ''}:${limit}`;
+  const now = Date.now();
+  const cached = queryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.data;
+  }
   const query = { userId };
 
   if (category && category !== 'All') {
@@ -65,7 +85,7 @@ async function queryExpensesSummary({ userId, category, month, search, startDate
     .map(([name, amount]) => ({ name, amount: Math.round(amount * 100) / 100 }))
     .sort((a, b) => b.amount - a.amount);
 
-  return {
+  const result = {
     totalAmount: Math.round(totalAmount * 100) / 100,
     count: expenses.length,
     period: month || (startDate && endDate ? `${startDate} to ${endDate}` : 'All time'),
@@ -81,14 +101,24 @@ async function queryExpensesSummary({ userId, category, month, search, startDate
       paymentMethod: e.paymentMethod,
     })),
   };
+
+  queryCache.set(cacheKey, { data: result, expiresAt: now + QUERY_CACHE_TTL_MS });
+  return result;
 }
 
 /**
  * Deterministic calculation of monthly budget status, limits, and critical alerts.
  */
 async function queryBudgetStatus({ userId, month, category }) {
-  const now = new Date();
-  const targetMonth = month || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const cacheKey = `${userId}:budget:${month || ''}:${category || ''}`;
+  const now = Date.now();
+  const cached = queryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.data;
+  }
+
+  const dateNow = new Date();
+  const targetMonth = month || `${dateNow.getFullYear()}-${String(dateNow.getMonth() + 1).padStart(2, '0')}`;
 
   const [year, m] = targetMonth.split('-').map(Number);
   const startOfMonth = new Date(Date.UTC(year, m - 1, 1, 0, 0, 0, 0));
@@ -142,7 +172,7 @@ async function queryBudgetStatus({ userId, month, category }) {
 
   const overallPercentage = totalLimit > 0 ? Math.round((totalSpent / totalLimit) * 100) : 0;
 
-  return {
+  const result = {
     month: targetMonth,
     totalLimit: Math.round(totalLimit * 100) / 100,
     totalSpent: Math.round(totalSpent * 100) / 100,
@@ -151,12 +181,21 @@ async function queryBudgetStatus({ userId, month, category }) {
     categories: filtered,
     closestToBudget: [...categoryStatuses].sort((a, b) => b.percentage - a.percentage)[0] || null,
   };
+
+  queryCache.set(cacheKey, { data: result, expiresAt: now + QUERY_CACHE_TTL_MS });
+  return result;
 }
 
 /**
  * Deterministic calculation of split balances: who owes whom and net standing.
  */
 async function querySplitSummary({ userId }) {
+  const cacheKey = `${userId}:split`;
+  const now = Date.now();
+  const cached = queryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.data;
+  }
   // Expenses user paid for (money owed to user)
   const paidByMe = await SplitExpense.find({ paidBy: userId });
   let totalOwedToYou = 0;
@@ -191,7 +230,7 @@ async function querySplitSummary({ userId }) {
     $or: [{ createdBy: userId }, { 'members.userId': userId }],
   });
 
-  return {
+  const result = {
     totalOwedToYou: Math.round(totalOwedToYou * 100) / 100,
     totalYouOwe: Math.round(totalYouOwe * 100) / 100,
     netBalance: Math.round((totalOwedToYou - totalYouOwe) * 100) / 100,
@@ -203,12 +242,21 @@ async function querySplitSummary({ userId }) {
         ? `You owe ₹${Math.round(totalYouOwe - totalOwedToYou)} in net balance across groups.`
         : 'All shared split balances are settled up.',
   };
+
+  queryCache.set(cacheKey, { data: result, expiresAt: now + QUERY_CACHE_TTL_MS });
+  return result;
 }
 
 /**
  * Deterministic calculation of tiffin meals, pricing, and counts.
  */
 async function queryTiffinSummary({ userId, month, date }) {
+  const cacheKey = `${userId}:tiffin:${month || ''}:${date || ''}`;
+  const now = Date.now();
+  const cached = queryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.data;
+  }
   const query = { userId, noTiffin: { $ne: true } };
 
   if (date) {
@@ -241,7 +289,7 @@ async function queryTiffinSummary({ userId, month, date }) {
     byMealType[mType] = (byMealType[mType] || 0) + qty;
   }
 
-  return {
+  const result = {
     totalMeals,
     totalCost: Math.round(totalCost * 100) / 100,
     byMealType,
@@ -254,6 +302,9 @@ async function queryTiffinSummary({ userId, month, date }) {
       date: e.date,
     })),
   };
+
+  queryCache.set(cacheKey, { data: result, expiresAt: now + QUERY_CACHE_TTL_MS });
+  return result;
 }
 
 module.exports = {
@@ -261,4 +312,5 @@ module.exports = {
   queryBudgetStatus,
   querySplitSummary,
   queryTiffinSummary,
+  invalidateUserQueryCache,
 };

@@ -27,6 +27,7 @@ const {
   queryBudgetStatus,
   querySplitSummary,
   queryTiffinSummary,
+  invalidateUserQueryCache,
 } = require('./groundedQueries');
 
 // In-memory bounded session context for recent mutations per user
@@ -551,8 +552,11 @@ async function executeTool(toolName, params = {}, context = {}) {
       }
     }
 
-    if (isMutation && requestId && executionResult?.success) {
-      saveIdempotencyResult(requestId, executionResult);
+    if (isMutation && executionResult?.success) {
+      invalidateUserQueryCache(userId);
+      if (requestId) {
+        saveIdempotencyResult(requestId, executionResult);
+      }
     }
 
     return executionResult;

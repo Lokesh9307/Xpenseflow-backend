@@ -244,25 +244,43 @@ function resolveCategoryFromList(inputPhrase, fullMessage, userCategories) {
   };
 }
 
+// High-performance in-memory RAM cache (60s TTL) to prevent repeated MongoDB roundtrips during chat
+const categoryCache = new Map();
+const CATEGORY_CACHE_TTL_MS = 60 * 1000;
+
+function invalidateUserCategoryCache(userId) {
+  if (userId) categoryCache.delete(String(userId));
+}
+
 /**
- * High-level helper: Fetches user categories from DB and resolves phrase.
+ * High-level helper: Fetches user categories from DB/RAM and resolves phrase.
  * @param {string} userId 
  * @param {string} phrase 
  * @param {string} fullMessage 
  */
 async function resolveUserCategory(userId, phrase, fullMessage) {
-  let categories = await Category.find({ userId });
-  if (!categories || categories.length === 0) {
-    // Seed defaults if none exist
-    const defaults = [
-      { name: 'Food & Dining', limit: 8000, color: '#A78BFA', icon: 'fast-food-outline' },
-      { name: 'Shopping', limit: 5000, color: '#84CC16', icon: 'cart-outline' },
-      { name: 'Travel & Commute', limit: 4000, color: '#38BDF8', icon: 'car-outline' },
-      { name: 'Bills & Utilities', limit: 6000, color: '#F59E0B', icon: 'flash-outline' },
-      { name: 'Entertainment', limit: 3000, color: '#F472B6', icon: 'film-outline' },
-      { name: 'Others', limit: 3000, color: '#9CA3AF', icon: 'ellipsis-horizontal-outline' },
-    ];
-    categories = await Category.insertMany(defaults.map((d) => ({ ...d, userId, isDefault: true })));
+  const cacheKey = String(userId);
+  const now = Date.now();
+  let categories;
+
+  const cached = categoryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    categories = cached.categories;
+  } else {
+    categories = await Category.find({ userId });
+    if (!categories || categories.length === 0) {
+      // Seed defaults if none exist
+      const defaults = [
+        { name: 'Food & Dining', limit: 8000, color: '#A78BFA', icon: 'fast-food-outline' },
+        { name: 'Shopping', limit: 5000, color: '#84CC16', icon: 'cart-outline' },
+        { name: 'Travel & Commute', limit: 4000, color: '#38BDF8', icon: 'car-outline' },
+        { name: 'Bills & Utilities', limit: 6000, color: '#F59E0B', icon: 'flash-outline' },
+        { name: 'Entertainment', limit: 3000, color: '#F472B6', icon: 'film-outline' },
+        { name: 'Others', limit: 3000, color: '#9CA3AF', icon: 'ellipsis-horizontal-outline' },
+      ];
+      categories = await Category.insertMany(defaults.map((d) => ({ ...d, userId, isDefault: true })));
+    }
+    categoryCache.set(cacheKey, { categories, expiresAt: now + CATEGORY_CACHE_TTL_MS });
   }
 
   return resolveCategoryFromList(phrase, fullMessage, categories);
@@ -273,4 +291,5 @@ module.exports = {
   normalizeString,
   resolveCategoryFromList,
   resolveUserCategory,
+  invalidateUserCategoryCache,
 };

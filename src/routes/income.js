@@ -4,7 +4,18 @@ const auth = require('../middleware/auth');
 const Income = require('../models/Income');
 const Expense = require('../models/Expense');
 
-// GET /api/income
+// GET /api/income/history (return full user income transactions for offline sync)
+router.get('/history', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const incomes = await Income.find({ userId }).sort({ date: -1 });
+    return res.json(incomes);
+  } catch (err) {
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// GET /api/income (summary)
 router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
