@@ -160,6 +160,32 @@ describe('tiffin.toUtcMidnight', () => {
   });
 });
 
+describe('tiffin expense sync refs', () => {
+  it('matches member and legacy rows for one entry without matching another entry or group', () => {
+    const pattern = tiffin.tiffinEntrySyncRefPattern(
+      'aaaaaaaaaaaaaaaaaaaaaaaa',
+      'bbbbbbbbbbbbbbbbbbbbbbbb'
+    );
+
+    assert.match(
+      'tiffin_aaaaaaaaaaaaaaaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbb_cccccccccccccccccccccccc',
+      pattern
+    );
+    assert.match(
+      'tiffin_aaaaaaaaaaaaaaaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbb',
+      pattern
+    );
+    assert.doesNotMatch(
+      'tiffin_aaaaaaaaaaaaaaaaaaaaaaaa_dddddddddddddddddddddddd_cccccccccccccccccccccccc',
+      pattern
+    );
+    assert.doesNotMatch(
+      'tiffin_aaaaaaaaaaaaaaaaaaaaaaab_bbbbbbbbbbbbbbbbbbbbbbbb_cccccccccccccccccccccccc',
+      pattern
+    );
+  });
+});
+
 describe('split shape bridge', () => {
   const webDoc = {
     _id: 'eeeeeeeeeeeeeeeeeeeeeeee',

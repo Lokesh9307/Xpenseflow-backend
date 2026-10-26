@@ -17,6 +17,101 @@ const {
   toUtcMidnight,
 } = require('../lib/tiffinBills');
 
+function tiffinEntrySyncRefPattern(entryId, groupId) {
+  const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^tiffin_${escapeRegex(entryId)}_${escapeRegex(groupId)}(?:_|$)`);
+}
+
+async function removeTiffinEntryExpenses(entryId, groupId) {
+  await Expense.deleteMany({
+    $or: [
+      { syncRefId: tiffinEntrySyncRefPattern(entryId, groupId) },
+      { syncRefId: `tiffin_${entryId}` },
+    ],
+  });
+}
+
+async function syncTiffinEntryExpenses(entry, group) {
+  const activeSyncRefs = [];
+  const normalizedMeal = String(entry.mealType || 'meal');
+  const entryBills = calculateEntryBills(
+    entry,
+    entry.pricePerTiffin || group.pricePerTiffin || group.defaultPrice,
+    group.members
+  );
+
+  if (!entry.noTiffin && normalizedMeal !== 'none') {
+    for (let idx = 0; idx < group.members.length; idx++) {
+      const member = group.members[idx];
+      const memberId = String(member._id || member.userId || idx);
+      const due = Number(
+        entryBills[memberId] ??
+          (member.userId ? entryBills[String(member.userId)] : undefined) ??
+          entryBills[String(idx)] ??
+          0
+      );
+      if (!Number.isFinite(due) || due <= 0) continue;
+
+      let targetUser = null;
+      if (member.userId) {
+        targetUser = await User.findById(member.userId);
+      } else if (member.email) {
+        targetUser = await User.findOne({ email: member.email.toLowerCase().trim() });
+      }
+
+      const isCreatorMember =
+        (member.userId && String(member.userId) === String(group.createdBy)) ||
+        (!member.userId &&
+          (['you', 'me'].includes(String(member.name || '').toLowerCase()) || idx === 0));
+      if (!targetUser && isCreatorMember) {
+        targetUser = await User.findById(group.createdBy);
+      }
+      if (!targetUser?.autoSyncTiffin) continue;
+
+      let tiffinCategory = await Category.findOne({
+        userId: targetUser._id,
+        name: 'Tiffin Expense',
+      });
+      if (!tiffinCategory) {
+        tiffinCategory = await Category.create({
+          userId: targetUser._id,
+          name: 'Tiffin Expense',
+          color: '#ea580c',
+          icon: 'restaurant-outline',
+          isDefault: false,
+        });
+      }
+
+      const syncRef = `tiffin_${entry._id}_${group._id}_${memberId}`;
+      activeSyncRefs.push(syncRef);
+      await Expense.findOneAndUpdate(
+        { userId: targetUser._id, syncRefId: syncRef },
+        {
+          userId: targetUser._id,
+          title: `Tiffin: ${normalizedMeal.charAt(0).toUpperCase()}${normalizedMeal.slice(1)} (${group.name})`,
+          amount: round2(due),
+          category: 'Tiffin Expense',
+          categoryId: tiffinCategory._id,
+          date: entry.date || new Date(),
+          paymentMethod: 'UPI',
+          notes: `Group: ${group.name} · Share: ₹${round2(due)}${entry.notes ? ` · ${entry.notes}` : ''}`,
+          syncSource: 'tiffin',
+          syncRefId: syncRef,
+        },
+        { upsert: true, new: true }
+      );
+    }
+  }
+
+  const syncRefPattern = tiffinEntrySyncRefPattern(entry._id, group._id);
+  await Expense.deleteMany({
+    syncRefId: {
+      $regex: syncRefPattern,
+      $nin: activeSyncRefs,
+    },
+  });
+}
+
 // Helper to generate static, unique 4-digit code per group
 const getStaticGroupCode = (groupOrId) => {
   if (!groupOrId) return '8824';
@@ -493,56 +588,7 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
     // Auto-sync into Expense Tracker if user or member has autoSyncTiffin enabled
     if (!isNoMeal && entry.memberBills) {
       try {
-        for (let idx = 0; idx < group.members.length; idx++) {
-          const m = group.members[idx];
-          const mId = String(m._id || m.userId);
-          const idxStr = String(idx);
-          const due = memberBills[mId] ?? memberBills[idxStr] ?? 0;
-          if (due > 0) {
-            let targetUser = null;
-            if (m.userId) {
-              targetUser = await User.findById(m.userId);
-            } else if (m.email) {
-              targetUser = await User.findOne({ email: m.email.toLowerCase().trim() });
-            }
-            const isCreatorMember = (m.userId && String(m.userId) === String(group.createdBy)) ||
-              (!m.userId && (String(m.name || '').toLowerCase() === 'you' || String(m.name || '').toLowerCase() === 'me' || idx === 0));
-            if (!targetUser && isCreatorMember) {
-              targetUser = await User.findById(group.createdBy);
-            }
-
-            if (targetUser && targetUser.autoSyncTiffin) {
-              let tiffinCat = await Category.findOne({ userId: targetUser._id, name: 'Tiffin Expense' });
-              if (!tiffinCat) {
-                tiffinCat = await Category.create({
-                  userId: targetUser._id,
-                  name: 'Tiffin Expense',
-                  color: '#ea580c',
-                  icon: 'restaurant-outline',
-                  isDefault: false,
-                });
-              }
-
-              const syncRef = `tiffin_${entry._id}_${groupId}_${mId}`;
-              await Expense.findOneAndUpdate(
-                { syncRefId: syncRef },
-                {
-                  userId: targetUser._id,
-                  title: `Tiffin: ${normalizedMeal.charAt(0).toUpperCase() + normalizedMeal.slice(1)} (${group.name})`,
-                  amount: due,
-                  category: 'Tiffin Expense',
-                  categoryId: tiffinCat._id,
-                  date: entry.date || new Date(),
-                  paymentMethod: 'UPI',
-                  notes: `Group: ${group.name} · Share: ₹${due}${entry.notes ? ` · ${entry.notes}` : ''}`,
-                  syncSource: 'tiffin',
-                  syncRefId: syncRef,
-                },
-                { upsert: true, new: true }
-              );
-            }
-          }
-        }
+        await syncTiffinEntryExpenses(entry, group);
       } catch (syncErr) {
         console.error('Tiffin auto-sync to expenses error:', syncErr);
       }
@@ -675,6 +721,12 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
     entry.editedAt = new Date();
     await entry.save();
 
+    try {
+      await syncTiffinEntryExpenses(entry, group);
+    } catch (syncErr) {
+      console.error('Tiffin expense sync after edit error:', syncErr);
+    }
+
     return res.json(normalizeEntryForClient(entry, group.members, pricePerUnit));
   } catch (err) {
     console.error('PATCH /api/tiffin/entries error:', err);
@@ -690,13 +742,8 @@ router.delete('/groups/:id/entries/:entryId', auth, async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({ message: 'Entry not found' });
     }
-    // Clean up synced Expense from Expense Tracker
-    await Expense.deleteMany({
-      $or: [
-        { syncRefId: `tiffin_${entryId}_${groupId}` },
-        { syncRefId: `tiffin_${entryId}` },
-      ],
-    }).catch(() => {});
+    // Canonical refs include the member id, so remove all member rows too.
+    await removeTiffinEntryExpenses(entryId, groupId);
     return res.json({ message: 'Entry deleted' });
   } catch (err) {
     console.error('DELETE /api/tiffin/entries error:', err);
@@ -846,4 +893,10 @@ router.get('/transactions', auth, async (req, res) => {
 
 module.exports = router;
 // Pure helpers exposed for unit tests (no DB required)
-module.exports._helpers = { sanitizeSplitPayload, normalizeEntryForClient, toUtcMidnight, round2 };
+module.exports._helpers = {
+  sanitizeSplitPayload,
+  normalizeEntryForClient,
+  toUtcMidnight,
+  round2,
+  tiffinEntrySyncRefPattern,
+};
