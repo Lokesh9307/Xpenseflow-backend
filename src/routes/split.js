@@ -247,7 +247,6 @@ router.post('/groups/:id/expenses', auth, async (req, res) => {
               splitCat = await Category.create({
                 userId: targetUser._id,
                 name: 'Split Expense',
-                limit: 5000,
                 color: '#8b5cf6',
                 icon: 'people-outline',
                 isDefault: false,

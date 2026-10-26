@@ -4,8 +4,61 @@ const auth = require('../middleware/auth');
 const Expense = require('../models/Expense');
 const Budget = require('../models/Budget');
 const Category = require('../models/Category');
+const TiffinGroup = require('../models/TiffinGroup');
+const TiffinEntry = require('../models/TiffinEntry');
+const { parseTiffinTitle, dateKey, buildUserTiffinTruth } = require('../lib/tiffinBills');
 
 const { autoProcessRecurringExpenses } = require('./recurring');
+
+/**
+ * Tiffin Tracker ⇄ Expense Tracker reconciliation (READ-TIME ONLY — stored
+ * rows are never modified).
+ *
+ * Older auto-sync backfills wrote a full-price row WITHOUT syncRefId next to
+ * the canonical per-member row (`syncSource: 'tiffin'` + syncRefId), so the
+ * Tiffin category showed roughly DOUBLE the real amount. This serves exactly
+ * ONE row per (group, meal, day) with the user's true share taken from the
+ * tiffin tracker itself — so the Expense Tracker's Tiffin numbers always
+ * equal what the Tiffin Tracker shows for that user.
+ */
+async function reconcileTiffinRows(userId, userEmail, expenses) {
+  const isTiffinRow = (e) =>
+    e.category === 'Tiffin Expense' || e.syncSource === 'tiffin' || /^Tiffin:/i.test(e.title || '');
+
+  if (!expenses.some(isTiffinRow)) return expenses;
+
+  const groups = await TiffinGroup.find({
+    archived: { $ne: true },
+    $or: [
+      { createdBy: userId },
+      { 'members.userId': userId },
+      ...(userEmail ? [{ 'members.email': String(userEmail).toLowerCase().trim() }] : []),
+    ],
+  });
+  if (groups.length === 0) return expenses;
+
+  const entries = await TiffinEntry.find({ groupId: { $in: groups.map((g) => g._id) } });
+  const truth = buildUserTiffinTruth(groups, entries, userId, userEmail);
+
+  const seen = new Set();
+  const out = [];
+  for (const e of expenses) {
+    if (!isTiffinRow(e)) {
+      out.push(e);
+      continue;
+    }
+    const parsed = parseTiffinTitle(e.title);
+    const key = parsed ? `${parsed.groupName}|${parsed.meal}|${dateKey(e.date)}` : null;
+    if (key && truth.has(key)) {
+      if (seen.has(key)) continue; // duplicate copy of the same meal/day
+      seen.add(key);
+      out.push({ ...e, amount: truth.get(key), category: 'Tiffin Expense' });
+    } else {
+      out.push(e); // no tracker entry — keep as recorded (legacy/manual)
+    }
+  }
+  return out;
+}
 
 // GET /api/expenses
 router.get('/', auth, async (req, res) => {
@@ -71,7 +124,9 @@ router.get('/', auth, async (req, res) => {
       };
     });
 
-    return res.json(expenses);
+    const reconciled = await reconcileTiffinRows(userId, req.user.email, expenses);
+
+    return res.json(reconciled);
   } catch (err) {
     console.error('Fetch expenses error:', err);
     return res.status(500).json({ message: err.message || 'Server error' });
@@ -108,8 +163,6 @@ router.post('/', auth, async (req, res) => {
         catDoc = await Category.create({
           userId,
           name: resolvedCategoryName.trim(),
-          limit: 5000,
-          monthlyLimit: 5000,
           color: '#0D9488',
           icon: 'LayoutGrid',
         });

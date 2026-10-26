@@ -7,6 +7,15 @@ const TiffinEntry = require('../models/TiffinEntry');
 const User = require('../models/User');
 const Category = require('../models/Category');
 const Expense = require('../models/Expense');
+// Shared billing math (also used by routes/expenses.js to reconcile the
+// Expense Tracker's Tiffin category against the Tiffin Tracker itself)
+const {
+  round2,
+  calculateEntryBills,
+  sanitizeSplitPayload,
+  normalizeEntryForClient,
+  toUtcMidnight,
+} = require('../lib/tiffinBills');
 
 // Helper to generate static, unique 4-digit code per group
 const getStaticGroupCode = (groupOrId) => {
@@ -22,173 +31,6 @@ const getStaticGroupCode = (groupOrId) => {
   }
   return String(Math.abs(hash) % 9000 + 1000);
 };
-
-// Helper to calculate exact per-person bills from any entry (supporting web shared-split & legacy)
-function calculateEntryBills(entry, pricePerUnit, groupMembers = []) {
-  const price = Number(entry.pricePerTiffin || entry.price || pricePerUnit || 100);
-  const bills = {};
-
-  // 1. If explicit memberBills is populated
-  if (entry.memberBills && Object.keys(entry.memberBills).length > 0) {
-    Object.entries(entry.memberBills).forEach(([id, amt]) => {
-      const val = typeof amt === 'object' && amt !== null ? (amt.total ?? amt.amount ?? amt.base) : amt;
-      const num = parseFloat(val) || 0;
-      bills[String(id)] = Math.round(num * 100) / 100;
-    });
-    return bills;
-  }
-
-  // 2. Web shared-split model: baseQuantity > 0 and participantMemberIds
-  const baseQty = Math.floor(Number(entry.baseQuantity) || 0);
-  const participantIds = Array.isArray(entry.participantMemberIds) && entry.participantMemberIds.length > 0
-    ? entry.participantMemberIds.map(String)
-    : (Array.isArray(entry.splitMemberIds) && entry.splitMemberIds.length > 0 ? entry.splitMemberIds.map(String) : []);
-
-  if (baseQty > 0 && participantIds.length > 0) {
-    const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
-    const baseShare = Math.round(((baseQty * price) / uniqueParticipants.length) * 100) / 100;
-    const extrasMap = entry.participantQuantities || entry.extras || {};
-
-    uniqueParticipants.forEach((pid) => {
-      bills[pid] = (bills[pid] || 0) + baseShare;
-    });
-
-    Object.entries(extrasMap).forEach(([pid, k]) => {
-      const extraCount = Math.max(0, Math.floor(Number(k) || 0));
-      if (extraCount > 0) {
-        bills[String(pid)] = Math.round(((bills[String(pid)] || 0) + extraCount * price) * 100) / 100;
-      }
-    });
-
-    return bills;
-  }
-
-  // 3. Web per-participant quantities / participantMemberIds
-  if (participantIds.length > 0) {
-    const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
-    const extrasMap = entry.participantQuantities || entry.extras || {};
-    uniqueParticipants.forEach((pid) => {
-      const count = Math.max(1, Math.floor(Number(extrasMap[pid]) || 1));
-      bills[pid] = Math.round(count * price * 100) / 100;
-    });
-    return bills;
-  }
-
-  // 4. Participants array format
-  if (Array.isArray(entry.participants) && entry.participants.length > 0) {
-    const total = Number(entry.totalCost ?? entry.totalPrice ?? (price * entry.participants.length));
-    const share = Math.round((total / entry.participants.length) * 100) / 100;
-    entry.participants.forEach((p) => {
-      const pId = String(p.memberId || p._id || p.userId);
-      bills[pId] = share;
-    });
-    return bills;
-  }
-
-  // 5. Fallback: split totalCost / totalPrice equally across all group members
-  const total = Number(entry.totalCost ?? entry.totalPrice ?? (price * (entry.quantity || entry.count || 1)));
-  if (Array.isArray(groupMembers) && groupMembers.length > 0) {
-    const splitShare = Math.round((total / groupMembers.length) * 100) / 100;
-    groupMembers.forEach((m) => {
-      const mId = String(m._id || m.userId);
-      bills[mId] = splitShare;
-    });
-    return bills;
-  }
-
-  // 6. Single-user fallback
-  const fallbackId = String(entry.userId || entry.addedBy || '0');
-  bills[fallbackId] = total;
-  return bills;
-}
-
-const round2 = (n) => Math.round(Number(n) * 100) / 100;
-
-/**
- * Web-compatible shared-split payload: keep ONLY real member-subdoc ids and
- * filter extras the same way myExpense's normalizeSplitPayload does. Mobile
- * clients historically sent every id variant (`_id`, `userId`, array index)
- * which inflated the split denominator and corrupted per-member bills.
- */
-function sanitizeSplitPayload(raw, group) {
-  if (!raw) return null;
-  const base = Math.floor(Number(raw.baseQuantity) || 0);
-  if (base < 1) return null;
-  const validIds = new Set(group.members.map((m) => String(m._id)));
-  const ids = [
-    ...new Set(
-      (Array.isArray(raw.splitMemberIds) ? raw.splitMemberIds : [])
-        .map((id) => String(id))
-        .filter((id) => id && validIds.has(id))
-    ),
-  ];
-  if (ids.length === 0) return null;
-  const extras = {};
-  if (raw.extras && typeof raw.extras === 'object') {
-    for (const [id, k] of Object.entries(raw.extras)) {
-      const q = Math.max(0, Math.floor(Number(k) || 0));
-      if (q > 0 && validIds.has(id)) extras[id] = (extras[id] || 0) + q;
-    }
-  }
-  return { baseQuantity: base, splitMemberIds: ids, extras };
-}
-
-/**
- * Read-time bridge between the two apps' field names. The web stores
- * { totalCost, participantMemberIds, participantQuantities, perPersonShare };
- * the mobile UI reads { totalPrice, splitMemberIds, extras, memberBills,
- * noTiffin }. This ONLY shapes API responses — stored documents are never
- * rewritten (the ledger stays untouched).
- */
-function normalizeEntryForClient(entry, groupMembers = [], priceFallback = 0) {
-  const o = entry && typeof entry.toObject === 'function' ? entry.toObject() : { ...(entry || {}) };
-  const price = Number(o.pricePerTiffin || priceFallback || 0);
-  const qty = Number(o.quantity ?? o.count ?? 1);
-
-  if (o.totalCost === undefined || o.totalCost === null) {
-    o.totalCost =
-      o.totalPrice !== undefined && o.totalPrice !== null
-        ? Number(o.totalPrice)
-        : round2(qty * price);
-  }
-  if (o.totalPrice === undefined || o.totalPrice === null) {
-    o.totalPrice = Number(o.totalCost);
-  }
-  if (!o.extras || Object.keys(o.extras).length === 0) {
-    o.extras =
-      o.participantQuantities && Object.keys(o.participantQuantities).length > 0
-        ? { ...o.participantQuantities }
-        : {};
-  }
-  if (!Array.isArray(o.splitMemberIds) || o.splitMemberIds.length === 0) {
-    o.splitMemberIds = Array.isArray(o.participantMemberIds) ? [...o.participantMemberIds] : [];
-  }
-  if (!Array.isArray(o.participantMemberIds) || o.participantMemberIds.length === 0) {
-    o.participantMemberIds = Array.isArray(o.splitMemberIds) ? [...o.splitMemberIds] : [];
-  }
-  if (o.noTiffin === undefined || o.noTiffin === null) o.noTiffin = o.mealType === 'none';
-  if (o.quantity === undefined || o.quantity === null) o.quantity = o.count ?? 1;
-  if (o.count === undefined || o.count === null) o.count = o.quantity ?? 1;
-  if (!o.memberBills || Object.keys(o.memberBills).length === 0) {
-    o.memberBills = o.noTiffin || o.mealType === 'none'
-      ? {}
-      : calculateEntryBills(o, price, groupMembers);
-  }
-  if (o.perPersonShare === undefined || o.perPersonShare === null) {
-    const participants = new Set(
-      [...(o.participantMemberIds || []), ...(o.splitMemberIds || [])].map(String)
-    ).size;
-    o.perPersonShare = participants > 0 ? round2(Number(o.totalCost) / participants) : 0;
-  }
-  return o;
-}
-
-/** Normalize a client-supplied date to UTC midnight (web's calendar-day key). */
-function toUtcMidnight(value) {
-  const d = value ? new Date(value) : new Date();
-  if (Number.isNaN(d.getTime())) return new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
 
 // GET /api/tiffin/groups — list all groups user is member of or created
 router.get('/groups', auth, async (req, res) => {
@@ -675,7 +517,6 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
                 tiffinCat = await Category.create({
                   userId: targetUser._id,
                   name: 'Tiffin Expense',
-                  limit: 5000,
                   color: '#ea580c',
                   icon: 'restaurant-outline',
                   isDefault: false,

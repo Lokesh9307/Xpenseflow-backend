@@ -41,7 +41,6 @@ router.put('/', auth, async (req, res) => {
         existingTiffinCat = await Category.create({
           userId,
           name: 'Tiffin Expense',
-          limit: 5000,
           color: '#ea580c',
           icon: 'restaurant-outline',
           isDefault: false,
@@ -143,7 +142,6 @@ router.put('/', auth, async (req, res) => {
         existingSplitCat = await Category.create({
           userId,
           name: 'Split Expense',
-          limit: 5000,
           color: '#8b5cf6',
           icon: 'people-outline',
           isDefault: false,

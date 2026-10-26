@@ -10,15 +10,15 @@ router.get('/', auth, async (req, res) => {
     const userId = req.user.id;
     let categories = await Category.find({ userId });
 
-    // Seed default categories if none exist
+    // Seed starter categories if none exist (no budgets — those are opt-in)
     if (categories.length === 0) {
       const defaults = [
-        { name: 'Food & Dining', limit: 8000, color: '#A78BFA', icon: 'fast-food-outline' },
-        { name: 'Shopping', limit: 5000, color: '#84CC16', icon: 'cart-outline' },
-        { name: 'Travel & Commute', limit: 4000, color: '#38BDF8', icon: 'car-outline' },
-        { name: 'Bills & Utilities', limit: 6000, color: '#F59E0B', icon: 'flash-outline' },
-        { name: 'Entertainment', limit: 3000, color: '#F472B6', icon: 'film-outline' },
-        { name: 'Others', limit: 3000, color: '#9CA3AF', icon: 'ellipsis-horizontal-outline' },
+        { name: 'Food & Dining', color: '#A78BFA', icon: 'fast-food-outline' },
+        { name: 'Shopping', color: '#84CC16', icon: 'cart-outline' },
+        { name: 'Travel & Commute', color: '#38BDF8', icon: 'car-outline' },
+        { name: 'Bills & Utilities', color: '#F59E0B', icon: 'flash-outline' },
+        { name: 'Entertainment', color: '#F472B6', icon: 'film-outline' },
+        { name: 'Others', color: '#9CA3AF', icon: 'ellipsis-horizontal-outline' },
       ];
 
       categories = await Category.insertMany(
@@ -36,18 +36,25 @@ router.get('/', auth, async (req, res) => {
 router.post('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { name, limit, warningThreshold, criticalThreshold, color, icon } = req.body;
+    const { name, limit, warningThreshold, criticalThreshold, color, icon, alertEnabled, alertPercent } = req.body;
 
     if (!name) {
       return res.status(400).json({ message: 'Category name is required' });
     }
 
+    // Budget limit is optional — only stored when a positive number is given
+    const parsedLimit = limit === undefined || limit === null || limit === '' ? NaN : parseFloat(limit);
+    const budgetLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
+
     const category = await Category.create({
       userId,
       name,
-      limit: limit || 5000,
+      limit: budgetLimit,
+      monthlyLimit: budgetLimit,
       warningThreshold: warningThreshold || 80,
       criticalThreshold: criticalThreshold || 95,
+      alertEnabled: !!alertEnabled,
+      alertPercent: Number.isFinite(parseFloat(alertPercent)) ? parseFloat(alertPercent) : 90,
       color: color || '#A78BFA',
       icon: icon || 'fast-food-outline',
     });
@@ -64,20 +71,37 @@ router.put('/:id', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const { id } = req.params;
-    const { name, limit, monthlyLimit, warningThreshold, criticalThreshold, color, icon } = req.body;
+    const { name, limit, monthlyLimit, warningThreshold, criticalThreshold, color, icon, alertEnabled, alertPercent } = req.body;
+
+    const update = {};
+    if (name) update.name = name;
+    if (color) update.color = color;
+    if (icon) update.icon = icon;
+    if (warningThreshold) update.warningThreshold = warningThreshold;
+    if (criticalThreshold) update.criticalThreshold = criticalThreshold;
+
+    // Budget limit is OPTIONAL: only touched when the client sent the field.
+    // null / '' / 0 clears the budget for this category.
+    if (limit !== undefined || monthlyLimit !== undefined) {
+      const raw = limit !== undefined ? limit : monthlyLimit;
+      const num = raw === null || raw === '' || raw === 0 ? NaN : parseFloat(raw);
+      const value = Number.isFinite(num) && num > 0 ? num : null;
+      update.limit = value;
+      update.monthlyLimit = value;
+    }
+
+    // Budget alert (user opt-in, threshold %)
+    if (alertEnabled !== undefined) update.alertEnabled = !!alertEnabled;
+    if (alertPercent !== undefined) {
+      const p = parseFloat(alertPercent);
+      if (Number.isFinite(p) && p > 0 && p <= 100) update.alertPercent = p;
+    }
 
     let category = null;
     if (id && id.length === 24) {
       category = await Category.findOneAndUpdate(
         { _id: id, userId },
-        {
-          ...(name && { name }),
-          ...((limit || monthlyLimit) && { limit: limit || monthlyLimit }),
-          ...(warningThreshold && { warningThreshold }),
-          ...(criticalThreshold && { criticalThreshold }),
-          ...(color && { color }),
-          ...(icon && { icon }),
-        },
+        { $set: update },
         { new: true }
       );
     }
@@ -85,12 +109,7 @@ router.put('/:id', auth, async (req, res) => {
     if (!category) {
       category = await Category.findOneAndUpdate(
         { name: req.body.previousName || name, userId },
-        {
-          ...(name && { name }),
-          ...((limit || monthlyLimit) && { limit: limit || monthlyLimit }),
-          ...(color && { color }),
-          ...(icon && { icon }),
-        },
+        { $set: update },
         { new: true }
       );
     }
@@ -99,7 +118,8 @@ router.put('/:id', auth, async (req, res) => {
       category = await Category.create({
         userId,
         name,
-        limit: limit || monthlyLimit || 5000,
+        limit: update.limit ?? null,
+        monthlyLimit: update.limit ?? null,
         color: color || '#0D9488',
         icon: icon || 'Food & Dining',
       });
