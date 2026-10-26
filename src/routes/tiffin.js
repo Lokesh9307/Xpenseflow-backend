@@ -102,6 +102,94 @@ function calculateEntryBills(entry, pricePerUnit, groupMembers = []) {
   return bills;
 }
 
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
+
+/**
+ * Web-compatible shared-split payload: keep ONLY real member-subdoc ids and
+ * filter extras the same way myExpense's normalizeSplitPayload does. Mobile
+ * clients historically sent every id variant (`_id`, `userId`, array index)
+ * which inflated the split denominator and corrupted per-member bills.
+ */
+function sanitizeSplitPayload(raw, group) {
+  if (!raw) return null;
+  const base = Math.floor(Number(raw.baseQuantity) || 0);
+  if (base < 1) return null;
+  const validIds = new Set(group.members.map((m) => String(m._id)));
+  const ids = [
+    ...new Set(
+      (Array.isArray(raw.splitMemberIds) ? raw.splitMemberIds : [])
+        .map((id) => String(id))
+        .filter((id) => id && validIds.has(id))
+    ),
+  ];
+  if (ids.length === 0) return null;
+  const extras = {};
+  if (raw.extras && typeof raw.extras === 'object') {
+    for (const [id, k] of Object.entries(raw.extras)) {
+      const q = Math.max(0, Math.floor(Number(k) || 0));
+      if (q > 0 && validIds.has(id)) extras[id] = (extras[id] || 0) + q;
+    }
+  }
+  return { baseQuantity: base, splitMemberIds: ids, extras };
+}
+
+/**
+ * Read-time bridge between the two apps' field names. The web stores
+ * { totalCost, participantMemberIds, participantQuantities, perPersonShare };
+ * the mobile UI reads { totalPrice, splitMemberIds, extras, memberBills,
+ * noTiffin }. This ONLY shapes API responses — stored documents are never
+ * rewritten (the ledger stays untouched).
+ */
+function normalizeEntryForClient(entry, groupMembers = [], priceFallback = 0) {
+  const o = entry && typeof entry.toObject === 'function' ? entry.toObject() : { ...(entry || {}) };
+  const price = Number(o.pricePerTiffin || priceFallback || 0);
+  const qty = Number(o.quantity ?? o.count ?? 1);
+
+  if (o.totalCost === undefined || o.totalCost === null) {
+    o.totalCost =
+      o.totalPrice !== undefined && o.totalPrice !== null
+        ? Number(o.totalPrice)
+        : round2(qty * price);
+  }
+  if (o.totalPrice === undefined || o.totalPrice === null) {
+    o.totalPrice = Number(o.totalCost);
+  }
+  if (!o.extras || Object.keys(o.extras).length === 0) {
+    o.extras =
+      o.participantQuantities && Object.keys(o.participantQuantities).length > 0
+        ? { ...o.participantQuantities }
+        : {};
+  }
+  if (!Array.isArray(o.splitMemberIds) || o.splitMemberIds.length === 0) {
+    o.splitMemberIds = Array.isArray(o.participantMemberIds) ? [...o.participantMemberIds] : [];
+  }
+  if (!Array.isArray(o.participantMemberIds) || o.participantMemberIds.length === 0) {
+    o.participantMemberIds = Array.isArray(o.splitMemberIds) ? [...o.splitMemberIds] : [];
+  }
+  if (o.noTiffin === undefined || o.noTiffin === null) o.noTiffin = o.mealType === 'none';
+  if (o.quantity === undefined || o.quantity === null) o.quantity = o.count ?? 1;
+  if (o.count === undefined || o.count === null) o.count = o.quantity ?? 1;
+  if (!o.memberBills || Object.keys(o.memberBills).length === 0) {
+    o.memberBills = o.noTiffin || o.mealType === 'none'
+      ? {}
+      : calculateEntryBills(o, price, groupMembers);
+  }
+  if (o.perPersonShare === undefined || o.perPersonShare === null) {
+    const participants = new Set(
+      [...(o.participantMemberIds || []), ...(o.splitMemberIds || [])].map(String)
+    ).size;
+    o.perPersonShare = participants > 0 ? round2(Number(o.totalCost) / participants) : 0;
+  }
+  return o;
+}
+
+/** Normalize a client-supplied date to UTC midnight (web's calendar-day key). */
+function toUtcMidnight(value) {
+  const d = value ? new Date(value) : new Date();
+  if (Number.isNaN(d.getTime())) return new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
 // GET /api/tiffin/groups — list all groups user is member of or created
 router.get('/groups', auth, async (req, res) => {
   try {
@@ -377,9 +465,11 @@ router.get('/groups/:id', auth, async (req, res) => {
       group,
       selectedMonth: selectedMonthKey,
       availableMonths,
-      entries: monthEntries, // Default to monthEntries for monthly ledger
-      allEntries: entries,
-      todayEntries,
+      // Read-time bridge so web-created entries (totalCost /
+      // participantQuantities) render fully on mobile — stored docs untouched.
+      entries: monthEntries.map((e) => normalizeEntryForClient(e, group.members, pricePerUnit)),
+      allEntries: entries.map((e) => normalizeEntryForClient(e, group.members, pricePerUnit)),
+      todayEntries: todayEntries.map((e) => normalizeEntryForClient(e, group.members, pricePerUnit)),
       monthTotal,
       monthQuantity,
       cycleTotal: monthTotal, // Cycle total now represents the active month
@@ -411,7 +501,14 @@ router.get('/groups/:id/entries', auth, async (req, res) => {
       query.date = { $gte: start, $lt: end };
     }
     const entries = await TiffinEntry.find(query).sort({ date: -1, createdAt: -1 });
-    return res.json(entries);
+    const group = await TiffinGroup.findById(groupId);
+    const members = group && Array.isArray(group.members) ? group.members : [];
+    const pricePerUnit = group
+      ? Number(group.pricePerTiffin || group.defaultPrice || 100)
+      : 100;
+    return res.json(
+      entries.map((e) => normalizeEntryForClient(e, members, pricePerUnit))
+    );
   } catch (err) {
     console.error('GET /api/tiffin/groups/:id/entries error:', err);
     return res.status(500).json({ message: err.message || 'Server error' });
@@ -432,27 +529,50 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
     const normalizedMeal = isNoMeal ? 'none' : (mealType || 'lunch').toLowerCase();
     const pricePerUnit = Number(group.pricePerTiffin || group.defaultPrice || 100);
 
+    // Date-only value stored as UTC midnight — the exact calendar-day key the
+    // web app uses — so the (groupId, date, mealType) index and the month
+    // filters of both apps agree on which day an entry belongs to.
+    const entryDate = toUtcMidnight(date);
+
     let mealCount = 0;
     let totalPrice = 0;
     let memberBills = {};
     let splitIds = [];
-    let extrasMap = extras || {};
+    let extrasMap = {};
 
     if (!isNoMeal) {
       const baseQty = baseQuantity !== undefined
         ? parseInt(baseQuantity, 10)
         : (parseInt(quantity || count, 10) || 1);
 
-      splitIds = Array.isArray(splitMemberIds) && splitMemberIds.length > 0
-        ? splitMemberIds.map(String)
-        : group.members.map((m, idx) => String(m._id || m.userId || idx));
+      // Keep ONLY real member ids (mobile used to send `_id` + `userId` +
+      // array-index variants which divided the base cost by 3× members).
+      const sanitized = sanitizeSplitPayload({ baseQuantity: baseQty, splitMemberIds, extras }, group);
+      if (sanitized) {
+        splitIds = sanitized.splitMemberIds;
+        extrasMap = sanitized.extras;
+      } else {
+        const validIds = new Set(group.members.map((m) => String(m._id)));
+        splitIds = [...new Set((Array.isArray(splitMemberIds) ? splitMemberIds : []).map(String))]
+          .filter((id) => validIds.has(id));
+        if (splitIds.length === 0) {
+          splitIds = group.members.map((m, idx) => String(m._id || m.userId || idx));
+        }
+        Object.entries(extras || {}).forEach(([id, k]) => {
+          const q = Math.max(0, Math.floor(Number(k) || 0));
+          if (q > 0 && validIds.has(id)) extrasMap[id] = (extrasMap[id] || 0) + q;
+        });
+      }
 
       const extraTiffinsTotal = Object.values(extrasMap).reduce((s, k) => s + (parseInt(k, 10) || 0), 0);
       mealCount = baseQty + extraTiffinsTotal;
       const extraVal = parseFloat(extraPrice) || 0;
       totalPrice = (baseQty * pricePerUnit) + (extraTiffinsTotal * pricePerUnit) + extraVal;
 
-      // Calculate member bills (support client passed bills or derive evenly)
+      // Calculate member bills (support client passed bills or derive evenly).
+      // Canonical key = member-subdoc id — that's what the mobile chips and the
+      // web's member summary look up (numeric-index keys would render as
+      // duplicate "Member" chips).
       const basePerPerson = splitIds.length > 0 ? (baseQty * pricePerUnit) / splitIds.length : 0;
       group.members.forEach((m, idx) => {
         const mId = String(m._id || m.userId);
@@ -462,7 +582,7 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
         if (clientMemberBills && (clientMemberBills[mId] !== undefined || clientMemberBills[idxStr] !== undefined)) {
           bill = parseFloat(clientMemberBills[mId] ?? clientMemberBills[idxStr]) || 0;
         } else {
-          const isParticipant = splitIds.includes(mId) || splitIds.includes(idxStr) || splitIds.includes(String(m.userId)) || splitIds.includes(String(m._id));
+          const isParticipant = splitIds.includes(mId) || splitIds.includes(String(m.userId)) || splitIds.includes(String(m._id));
           bill = isParticipant ? basePerPerson : 0;
           const userExtra = extrasMap[mId] ?? extrasMap[idxStr] ?? 0;
           if (userExtra) {
@@ -470,30 +590,63 @@ router.post('/groups/:id/entries', auth, async (req, res) => {
           }
         }
         memberBills[mId] = Math.round(bill * 100) / 100;
-        memberBills[idxStr] = Math.round(bill * 100) / 100;
       });
     }
 
-    const entry = await TiffinEntry.create({
+    // One entry per group per meal per calendar day — same rule the web app
+    // enforces via its unique index. Return 409 (like the web) instead of
+    // letting a duplicate slip through or blowing up with a 500.
+    const existingSameDay = await TiffinEntry.findOne({
       groupId,
-      userId,
-      date: date ? new Date(date) : new Date(),
+      date: entryDate,
       mealType: normalizedMeal,
-      count: mealCount,
-      quantity: mealCount,
-      baseQuantity: isNoMeal ? 0 : (baseQuantity || mealCount),
-      pricePerTiffin: pricePerUnit,
-      totalCost: totalPrice,
-      totalPrice,
-      participantMemberIds: splitIds,
-      splitMemberIds: splitIds,
-      extras: extrasMap,
-      memberBills,
-      extraPrice: isNoMeal ? 0 : (parseFloat(extraPrice) || 0),
-      noTiffin: isNoMeal,
-      participants: Array.isArray(participants) ? participants : [],
-      notes: isNoMeal ? (notes || 'No one took tiffin today') : (notes || ''),
     });
+    if (existingSameDay) {
+      return res.status(409).json({
+        message: `A ${normalizedMeal} record already exists for this date — edit it instead`,
+        entryId: existingSameDay._id,
+      });
+    }
+
+    const participantCount = new Set(splitIds.map(String)).size;
+    const perPersonShare =
+      !isNoMeal && participantCount > 0 ? round2(totalPrice / participantCount) : 0;
+
+    let entry;
+    try {
+      entry = await TiffinEntry.create({
+        groupId,
+        userId,
+        addedBy: userId,
+        date: entryDate,
+        mealType: normalizedMeal,
+        count: mealCount,
+        quantity: mealCount,
+        baseQuantity: isNoMeal ? 0 : (baseQuantity || mealCount),
+        pricePerTiffin: pricePerUnit,
+        totalCost: totalPrice,
+        totalPrice,
+        perPersonShare,
+        participantMemberIds: splitIds,
+        splitMemberIds: splitIds,
+        participantQuantities: extrasMap,
+        extras: extrasMap,
+        memberBills,
+        extraPrice: isNoMeal ? 0 : (parseFloat(extraPrice) || 0),
+        noTiffin: isNoMeal,
+        participants: Array.isArray(participants) ? participants : [],
+        notes: isNoMeal ? (notes || 'No one took tiffin today') : (notes || ''),
+        source: 'manual',
+      });
+    } catch (createErr) {
+      if (createErr && createErr.code === 11000) {
+        return res.status(409).json({
+          message: 'A record already exists for this date — edit it instead',
+          entryId: null,
+        });
+      }
+      throw createErr;
+    }
 
     // Auto-sync into Expense Tracker if user or member has autoSyncTiffin enabled
     if (!isNoMeal && entry.memberBills) {
@@ -575,7 +728,7 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
     if (!entry) return res.status(404).json({ message: 'Entry not found' });
 
     const isNoMeal = noTiffin === true || mealType === 'none';
-    const pricePerUnit = group.defaultPrice || group.pricePerTiffin || 80;
+    const pricePerUnit = group.pricePerTiffin || group.defaultPrice || 80;
 
     if (isNoMeal) {
       entry.noTiffin = true;
@@ -584,9 +737,14 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
       entry.quantity = 0;
       entry.baseQuantity = 0;
       entry.extras = {};
+      entry.participantQuantities = {};
       entry.memberBills = {};
       entry.extraPrice = 0;
       entry.totalPrice = 0;
+      entry.totalCost = 0;
+      entry.perPersonShare = 0;
+      entry.participantMemberIds = [];
+      entry.splitMemberIds = [];
       entry.notes = notes || 'No one took tiffin today';
     } else {
       entry.noTiffin = false;
@@ -596,11 +754,45 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
         ? parseInt(baseQuantity, 10)
         : (parseInt(quantity || count || entry.baseQuantity || 1, 10));
 
-      const splitIds = Array.isArray(splitMemberIds) && splitMemberIds.length > 0
-        ? splitMemberIds
-        : (entry.splitMemberIds && entry.splitMemberIds.length > 0 ? entry.splitMemberIds : group.members.map((m) => String(m._id || m.userId)));
+      const validIds = new Set(group.members.map((m) => String(m._id)));
+      const previousSplitIds =
+        (Array.isArray(entry.splitMemberIds) && entry.splitMemberIds.length > 0
+          ? entry.splitMemberIds
+          : entry.participantMemberIds) || [];
+      const previousExtras =
+        Object.keys(entry.extras || {}).length > 0
+          ? entry.extras
+          : (entry.participantQuantities || {});
 
-      const extrasMap = extras !== undefined ? extras : (entry.extras || {});
+      const sanitized = sanitizeSplitPayload(
+        {
+          baseQuantity: baseQty,
+          splitMemberIds:
+            Array.isArray(splitMemberIds) && splitMemberIds.length > 0
+              ? splitMemberIds
+              : previousSplitIds,
+          extras: extras !== undefined ? extras : previousExtras,
+        },
+        group
+      );
+
+      let splitIds;
+      let extrasMap;
+      if (sanitized) {
+        splitIds = sanitized.splitMemberIds;
+        extrasMap = sanitized.extras;
+      } else {
+        splitIds = [...new Set(previousSplitIds.map(String))].filter((id) => validIds.has(id));
+        if (splitIds.length === 0) {
+          splitIds = group.members.map((m, idx) => String(m._id || m.userId || idx));
+        }
+        extrasMap = {};
+        Object.entries(previousExtras || {}).forEach(([id, k]) => {
+          const q = Math.max(0, Math.floor(Number(k) || 0));
+          if (q > 0 && validIds.has(id)) extrasMap[id] = (extrasMap[id] || 0) + q;
+        });
+      }
+
       const extraTiffinsTotal = Object.values(extrasMap).reduce((s, k) => s + (parseInt(k, 10) || 0), 0);
       const totalQty = baseQty + extraTiffinsTotal;
 
@@ -608,11 +800,18 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
       entry.quantity = totalQty;
       entry.baseQuantity = baseQty;
       entry.splitMemberIds = splitIds;
+      // Web reads `participantMemberIds` — must follow every edit
+      entry.participantMemberIds = splitIds;
       entry.extras = extrasMap;
+      entry.participantQuantities = extrasMap;
 
       const extraVal = extraPrice !== undefined ? parseFloat(extraPrice) || 0 : (entry.extraPrice || 0);
       entry.extraPrice = extraVal;
-      entry.totalPrice = (baseQty * pricePerUnit) + (extraTiffinsTotal * pricePerUnit) + extraVal;
+      const newTotal = (baseQty * pricePerUnit) + (extraTiffinsTotal * pricePerUnit) + extraVal;
+      entry.totalPrice = newTotal;
+      entry.totalCost = newTotal;
+      const participantCount = new Set(splitIds.map(String)).size;
+      entry.perPersonShare = participantCount > 0 ? round2(newTotal / participantCount) : 0;
 
       // Recalculate member bills
       const basePerPerson = splitIds.length > 0 ? (baseQty * pricePerUnit) / splitIds.length : 0;
@@ -631,10 +830,11 @@ router.patch('/groups/:id/entries/:entryId', auth, async (req, res) => {
       if (participants !== undefined) entry.participants = participants;
     }
 
-    if (date) entry.date = new Date(date);
+    if (date) entry.date = toUtcMidnight(date);
+    entry.editedAt = new Date();
     await entry.save();
 
-    return res.json(entry);
+    return res.json(normalizeEntryForClient(entry, group.members, pricePerUnit));
   } catch (err) {
     console.error('PATCH /api/tiffin/entries error:', err);
     return res.status(500).json({ message: err.message || 'Server error' });
@@ -750,7 +950,10 @@ router.get('/transactions', auth, async (req, res) => {
     const groupIds = groups.map((g) => g._id);
     const groupMap = {};
     groups.forEach((g) => {
-      groupMap[String(g._id)] = g.name;
+      groupMap[String(g._id)] = {
+        name: g.name,
+        price: Number(g.pricePerTiffin || g.defaultPrice || 100),
+      };
     });
 
     let dateFilter = {};
@@ -768,21 +971,30 @@ router.get('/transactions', auth, async (req, res) => {
       .sort({ date: -1 })
       .limit(300);
 
-    const formatted = entries.map((e) => ({
-      _id: e._id,
-      groupId: e.groupId,
-      groupName: groupMap[String(e.groupId)] || 'Tiffin Group',
-      date: e.date,
-      mealType: e.mealType || 'lunch',
-      count: e.count ?? e.quantity ?? 1,
-      quantity: e.quantity ?? e.count ?? 1,
-      extraPrice: e.extraPrice || 0,
-      totalPrice: e.totalPrice || 0,
-      totalCost: e.totalPrice || 0,
-      noTiffin: e.noTiffin || e.mealType === 'none',
-      notes: e.notes || '',
-      participants: e.participants || [],
-    }));
+    const formatted = entries.map((e) => {
+      const info = groupMap[String(e.groupId)] || { name: 'Tiffin Group', price: 100 };
+      const price = Number(e.pricePerTiffin || info.price || 100);
+      const count = e.count ?? e.quantity ?? 1;
+      // Web-created entries carry totalCost only; mobile reads totalPrice
+      const total = e.totalPrice ?? e.totalCost ?? Math.round(count * price * 100) / 100;
+      return {
+        _id: e._id,
+        groupId: e.groupId,
+        groupName: info.name || 'Tiffin Group',
+        date: e.date,
+        mealType: e.mealType || 'lunch',
+        count,
+        quantity: e.quantity ?? e.count ?? 1,
+        extraPrice: e.extraPrice || 0,
+        totalPrice: total,
+        totalCost: total,
+        baseQuantity: e.baseQuantity,
+        extras: e.extras && Object.keys(e.extras).length > 0 ? e.extras : (e.participantQuantities || {}),
+        noTiffin: e.noTiffin || e.mealType === 'none',
+        notes: e.notes || '',
+        participants: e.participants || [],
+      };
+    });
 
     return res.json(formatted);
   } catch (err) {
@@ -792,3 +1004,5 @@ router.get('/transactions', auth, async (req, res) => {
 });
 
 module.exports = router;
+// Pure helpers exposed for unit tests (no DB required)
+module.exports._helpers = { sanitizeSplitPayload, normalizeEntryForClient, toUtcMidnight, round2 };

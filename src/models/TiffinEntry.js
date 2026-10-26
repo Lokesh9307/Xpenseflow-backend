@@ -12,7 +12,8 @@ const tiffinEntrySchema = new mongoose.Schema(
     pricePerTiffin: { type: Number },
     totalCost: { type: Number },
     totalPrice: { type: Number },
-    perPersonShare: { type: Number },
+    // Required by the web app's schema — keep it populated on every write
+    perPersonShare: { type: Number, min: 0 },
     extraPrice: { type: Number, default: 0 },
     noTiffin: { type: Boolean, default: false },
     baseQuantity: { type: Number },
@@ -30,10 +31,10 @@ const tiffinEntrySchema = new mongoose.Schema(
     ],
     notes: { type: String, default: '' },
     source: { type: String, enum: ['manual', 'auto'], default: 'manual' },
+    editedAt: { type: Date },
   },
   { timestamps: true }
 );
 
 module.exports =
   mongoose.models.TiffinEntry || mongoose.model('TiffinEntry', tiffinEntrySchema);
-

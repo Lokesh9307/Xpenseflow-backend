@@ -29,7 +29,7 @@ router.get('/', auth, async (req, res) => {
 });
 
 // PUT /api/notifications (mark read)
-router.put('/', auth, async (req, res) => {
+const markAllRead = async (req, res) => {
   try {
     const userId = req.user.id;
     await Notification.updateMany({ userId }, { $set: { isRead: true } });
@@ -37,6 +37,10 @@ router.put('/', auth, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ message: err.message || 'Server error' });
   }
-});
+};
+
+router.put('/', auth, markAllRead);
+// Alias used by the mobile app
+router.put('/mark-read', auth, markAllRead);
 
 module.exports = router;
