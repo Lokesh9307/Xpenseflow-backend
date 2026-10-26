@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 // Pure helpers (no DB connection required — model registration is side-effect free)
 const tiffin = require('../routes/tiffin')._helpers;
+const tiffinBills = require('../lib/tiffinBills');
 const split = require('../routes/split')._helpers;
 
 const group = {
@@ -142,6 +143,93 @@ describe('tiffin.normalizeEntryForClient', () => {
       60
     );
     assert.equal(o.perPersonShare, 120);
+  });
+});
+
+describe('tiffin historical expense amounts', () => {
+  it('derives legacy unit prices from the recorded total, not the current group price', () => {
+    const entry = {
+      _id: 'eeeeeeeeeeeeeeeeeeeeeeee',
+      groupId: 'ffffffffffffffffffffffff',
+      date: new Date('2026-10-25T00:00:00.000Z'),
+      mealType: 'lunch',
+      totalCost: 360,
+      baseQuantity: 3,
+      participantMemberIds: [
+        'aaaaaaaaaaaaaaaaaaaaaaaa',
+        'bbbbbbbbbbbbbbbbbbbbbbbb',
+      ],
+      participantQuantities: { aaaaaaaaaaaaaaaaaaaaaaaa: 1 },
+    };
+
+    const lowCurrentPrice = tiffinBills.calculateEntryBills(entry, 90);
+    const changedCurrentPrice = tiffinBills.calculateEntryBills(entry, 200);
+
+    assert.deepEqual(changedCurrentPrice, lowCurrentPrice);
+    assert.deepEqual(changedCurrentPrice, {
+      aaaaaaaaaaaaaaaaaaaaaaaa: 225,
+      bbbbbbbbbbbbbbbbbbbbbbbb: 135,
+    });
+  });
+
+  it('keeps same-name groups separate and only exposes unambiguous legacy matches', () => {
+    const date = new Date('2026-10-25T00:00:00.000Z');
+    const memberId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const groups = [
+      {
+        _id: 'bbbbbbbbbbbbbbbbbbbbbbbb',
+        name: 'Home Tiffin',
+        members: [{ _id: memberId, userId: '111111111111111111111111' }],
+        pricePerTiffin: 100,
+      },
+      {
+        _id: 'cccccccccccccccccccccccc',
+        name: 'Home Tiffin',
+        members: [{ _id: memberId, userId: '111111111111111111111111' }],
+        pricePerTiffin: 100,
+      },
+    ];
+    const entries = [
+      {
+        _id: 'dddddddddddddddddddddddd',
+        groupId: groups[0]._id,
+        date,
+        mealType: 'lunch',
+        totalCost: 100,
+        memberBills: { [memberId]: 25 },
+      },
+      {
+        _id: 'eeeeeeeeeeeeeeeeeeeeeeee',
+        groupId: groups[1]._id,
+        date,
+        mealType: 'lunch',
+        totalCost: 100,
+        memberBills: { [memberId]: 75 },
+      },
+    ];
+
+    const truth = tiffinBills.buildUserTiffinTruth(
+      groups,
+      entries,
+      '111111111111111111111111'
+    );
+
+    assert.equal(truth.get(`entry:${groups[0]._id}:${entries[0]._id}`), 25);
+    assert.equal(truth.get(`entry:${groups[1]._id}:${entries[1]._id}`), 75);
+    assert.equal(truth.has('legacy:Home Tiffin|lunch|2026-10-25'), false);
+  });
+
+  it('matches canonical expense rows using their group and entry IDs', () => {
+    const entryId = 'dddddddddddddddddddddddd';
+    const groupId = 'bbbbbbbbbbbbbbbbbbbbbbbb';
+    assert.equal(
+      tiffinBills.tiffinExpenseTruthKey({
+        syncRefId: `tiffin_${entryId}_${groupId}_aaaaaaaaaaaaaaaaaaaaaaaa`,
+        title: 'Tiffin: Lunch (Home Tiffin)',
+        date: '2026-10-25T00:00:00.000Z',
+      }),
+      `entry:${groupId}:${entryId}`
+    );
   });
 });
 

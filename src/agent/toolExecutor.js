@@ -21,7 +21,12 @@ const TiffinGroup = require('../models/TiffinGroup');
 
 const { resolveUserCategory } = require('./categoryResolver');
 const { resolveNavigation } = require('./navigationRegistry');
-const { checkIdempotency, lockRequestId, saveIdempotencyResult } = require('./idempotency');
+const {
+  checkIdempotency,
+  lockRequestId,
+  saveIdempotencyResult,
+  markIdempotencyFailed,
+} = require('./idempotency');
 const {
   queryExpensesSummary,
   queryBudgetStatus,
@@ -32,6 +37,34 @@ const {
 
 // In-memory bounded session context for recent mutations per user
 const lastMutationByUser = new Map();
+
+async function resolveExpenseTarget(userId, targetQuery) {
+  const query = String(targetQuery || '').trim();
+  if (!query) return { status: 'missing' };
+
+  if (/^[0-9a-fA-F]{24}$/.test(query)) {
+    const record = await Expense.findOne({ _id: query, userId });
+    return record ? { status: 'found', record } : { status: 'missing' };
+  }
+
+  if (/^(?:my )?(?:last|latest|most recent) expense$/i.test(query)) {
+    const record = await Expense.findOne({ userId }).sort({ createdAt: -1 });
+    return record ? { status: 'found', record } : { status: 'missing' };
+  }
+
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matches = await Expense.find({
+    userId,
+    $or: [
+      { title: { $regex: escaped, $options: 'i' } },
+      { category: { $regex: `^${escaped}$`, $options: 'i' } },
+    ],
+  }).sort({ date: -1 }).limit(2);
+
+  if (matches.length === 1) return { status: 'found', record: matches[0] };
+  if (matches.length > 1) return { status: 'ambiguous', records: matches };
+  return { status: 'missing' };
+}
 
 /**
  * Parses user-provided date string into valid Date object.
@@ -54,7 +87,7 @@ function parseDateParam(dateStr) {
   }
 
   const parsed = new Date(dateStr);
-  return isNaN(parsed.getTime()) ? now : parsed;
+  return parsed;
 }
 
 /**
@@ -72,15 +105,23 @@ async function executeTool(toolName, params = {}, context = {}) {
 
   // Check idempotency for mutations
   const isMutation = ['create_expense', 'update_expense', 'delete_expense', 'undo_last_expense', 'create_split', 'log_tiffin'].includes(toolName);
-  if (isMutation && requestId) {
-    const check = checkIdempotency(requestId);
+  const operationId = requestId ? `${userId}:${requestId}` : '';
+  if (isMutation && operationId) {
+    const check = checkIdempotency(operationId);
     if (check.exists && check.status === 'COMPLETED') {
       return {
         ...check.result,
         idempotentReplay: true,
       };
     }
-    lockRequestId(requestId);
+    if (check.exists) {
+      return {
+        success: false,
+        intent: 'operation.in_progress',
+        message: 'An operation with this request ID is already being processed or has an unresolved result. Check its outcome before retrying.',
+      };
+    }
+    lockRequestId(operationId);
   }
 
   let executionResult = null;
@@ -137,6 +178,18 @@ async function executeTool(toolName, params = {}, context = {}) {
         }
 
         const expenseDate = parseDateParam(params.date);
+        if (Number.isNaN(expenseDate.getTime())) {
+          return {
+            success: false,
+            intent: 'clarification.required',
+            message: 'I could not understand the expense date.',
+            clarification: {
+              question: 'What date was this expense made?',
+              options: [],
+              missingField: 'date',
+            },
+          };
+        }
         const resolvedTitle = params.title?.trim() || `${categoryResolution.categoryName} expense`;
         const paymentMethod = params.paymentMethod || 'UPI';
 
@@ -212,36 +265,98 @@ async function executeTool(toolName, params = {}, context = {}) {
 
       case 'update_expense': {
         const { targetQuery, updates } = params;
-        let targetDoc = null;
-
-        if (targetQuery && /^[0-9a-fA-F]{24}$/.test(targetQuery)) {
-          targetDoc = await Expense.findOne({ _id: targetQuery, userId });
-        } else {
-          // Resolve most recent expense matching query
-          targetDoc = await Expense.findOne({ userId }).sort({ date: -1 });
-        }
-
-        if (!targetDoc) {
+        const target = await resolveExpenseTarget(userId, targetQuery);
+        if (target.status === 'ambiguous') {
           return {
             success: false,
-            message: 'Could not find the target expense to update.',
+            intent: 'clarification.required',
+            clarification: {
+              question: 'I found more than one matching expense. Which exact transaction do you mean?',
+              options: target.records.map((record) =>
+                `${record.title} — ₹${record.amount} — ${new Date(record.date).toLocaleDateString()}`
+              ),
+              missingField: 'targetRecord',
+            },
+            message: 'Please identify the exact expense before I change it.',
+          };
+        }
+        const targetDoc = target.record;
+        if (target.status !== 'found' || !targetDoc) {
+          return {
+            success: false,
+            intent: 'clarification.required',
+            clarification: {
+              question: 'Which exact expense should I update? Give its title or transaction ID.',
+              options: [],
+              missingField: 'targetRecord',
+            },
+            message: 'I could not safely identify that expense.',
           };
         }
 
         const updatePayload = {};
-        if (updates.amount && !isNaN(Number(updates.amount))) {
+        if (updates.amount !== undefined) {
+          if (!Number.isFinite(Number(updates.amount)) || Number(updates.amount) <= 0) {
+            return {
+              success: false,
+              intent: 'clarification.required',
+              message: 'The updated amount must be greater than zero.',
+              clarification: {
+                question: 'What positive amount should I use?',
+                options: [],
+                missingField: 'amount',
+              },
+            };
+          }
           updatePayload.amount = Number(updates.amount);
         }
         if (updates.title) updatePayload.title = updates.title.trim();
         if (updates.paymentMethod) updatePayload.paymentMethod = updates.paymentMethod;
-        if (updates.date) updatePayload.date = parseDateParam(updates.date);
+        if (updates.date) {
+          const parsedDate = parseDateParam(updates.date);
+          if (Number.isNaN(parsedDate.getTime())) {
+            return {
+              success: false,
+              intent: 'clarification.required',
+              message: 'I could not understand the updated date.',
+              clarification: {
+                question: 'What date should I use?',
+                options: [],
+                missingField: 'date',
+              },
+            };
+          }
+          updatePayload.date = parsedDate;
+        }
 
         if (updates.category) {
           const catRes = await resolveUserCategory(userId, updates.category, rawMessage);
-          if (catRes.resolved) {
-            updatePayload.category = catRes.categoryName;
-            updatePayload.categoryId = catRes.categoryId;
+          if (!catRes.resolved) {
+            return {
+              success: false,
+              intent: 'clarification.required',
+              message: catRes.reason || 'Which existing category should I use?',
+              clarification: {
+                question: catRes.reason || 'Which existing category should I use?',
+                options: catRes.candidates || [],
+                missingField: 'category',
+              },
+            };
           }
+          updatePayload.category = catRes.categoryName;
+          updatePayload.categoryId = catRes.categoryId;
+        }
+        if (Object.keys(updatePayload).length === 0) {
+          return {
+            success: false,
+            intent: 'clarification.required',
+            message: 'Tell me which expense field you want to change.',
+            clarification: {
+              question: 'What should I change: amount, title, category, payment method, or date?',
+              options: [],
+              missingField: 'updates',
+            },
+          };
         }
 
         const updated = await Expense.findOneAndUpdate(
@@ -268,18 +383,32 @@ async function executeTool(toolName, params = {}, context = {}) {
 
       case 'delete_expense': {
         const { targetQuery } = params;
-        let targetDoc = null;
-
-        if (targetQuery && /^[0-9a-fA-F]{24}$/.test(targetQuery)) {
-          targetDoc = await Expense.findOne({ _id: targetQuery, userId });
-        } else {
-          targetDoc = await Expense.findOne({ userId }).sort({ date: -1 });
-        }
-
-        if (!targetDoc) {
+        const target = await resolveExpenseTarget(userId, targetQuery);
+        if (target.status === 'ambiguous') {
           return {
             success: false,
-            message: 'Could not find the expense to delete.',
+            intent: 'clarification.required',
+            clarification: {
+              question: 'I found more than one matching expense. Which exact transaction should be deleted?',
+              options: target.records.map((record) =>
+                `${record.title} — ₹${record.amount} — ${new Date(record.date).toLocaleDateString()}`
+              ),
+              missingField: 'targetRecord',
+            },
+            message: 'Please identify the exact expense before deletion.',
+          };
+        }
+        const targetDoc = target.record;
+        if (target.status !== 'found' || !targetDoc) {
+          return {
+            success: false,
+            intent: 'clarification.required',
+            clarification: {
+              question: 'Which exact expense should I delete? Give its title or transaction ID.',
+              options: [],
+              missingField: 'targetRecord',
+            },
+            message: 'I could not safely identify that expense.',
           };
         }
 
@@ -429,6 +558,18 @@ async function executeTool(toolName, params = {}, context = {}) {
       case 'log_tiffin': {
         const mealType = (params.mealType || 'lunch').toLowerCase();
         const mealDate = parseDateParam(params.date);
+        if (Number.isNaN(mealDate.getTime())) {
+          return {
+            success: false,
+            intent: 'clarification.required',
+            message: 'I could not understand the Tiffin date.',
+            clarification: {
+              question: 'What date was this meal?',
+              options: [],
+              missingField: 'date',
+            },
+          };
+        }
         const count = parseInt(params.count, 10) || 1;
 
         let group = await TiffinGroup.findOne({
@@ -554,14 +695,19 @@ async function executeTool(toolName, params = {}, context = {}) {
 
     if (isMutation && executionResult?.success) {
       invalidateUserQueryCache(userId);
-      if (requestId) {
-        saveIdempotencyResult(requestId, executionResult);
+      if (operationId) {
+        saveIdempotencyResult(operationId, executionResult);
       }
+    } else if (isMutation && operationId) {
+      markIdempotencyFailed(operationId, executionResult?.message || 'Operation did not complete.');
     }
 
     return executionResult;
   } catch (err) {
     console.error(`[executeTool] Error in ${toolName}:`, err);
+    if (isMutation && operationId) {
+      markIdempotencyFailed(operationId, err.message || 'Execution failed');
+    }
     return {
       success: false,
       error: err.message || 'Execution failed',
@@ -572,4 +718,5 @@ async function executeTool(toolName, params = {}, context = {}) {
 
 module.exports = {
   executeTool,
+  parseDateParam,
 };

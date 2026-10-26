@@ -11,6 +11,7 @@ const TiffinGroup = require('../models/TiffinGroup');
 const TiffinEntry = require('../models/TiffinEntry');
 const SplitGroup = require('../models/SplitGroup');
 const SplitExpense = require('../models/SplitExpense');
+const { calculateEntryBills } = require('../lib/tiffinBills');
 
 // GET /api/profile
 router.get('/', auth, async (req, res) => {
@@ -62,45 +63,21 @@ router.put('/', auth, async (req, res) => {
           const mId = userMember ? String(userMember._id || userMember.userId) : userId;
 
           for (const e of entries) {
-            const pricePerUnit = Number(e.pricePerTiffin || g.pricePerTiffin || g.defaultPrice || 100);
             let due = 0;
+            const bills = calculateEntryBills(
+              e,
+              e.pricePerTiffin || g.pricePerTiffin || g.defaultPrice,
+              g.members
+            );
+            const memberIndex = userMember ? g.members.indexOf(userMember) : -1;
+            const billKeys = [mId, userId, memberIndex >= 0 ? String(memberIndex) : null].filter(Boolean);
+            const billKey = billKeys.find((key) => Object.prototype.hasOwnProperty.call(bills, key));
 
-            if (e.memberBills && (e.memberBills[mId] !== undefined || e.memberBills[userId] !== undefined)) {
-              due = parseFloat(e.memberBills[mId] ?? e.memberBills[userId]) || 0;
+            if (billKey !== undefined) {
+              due = Number(bills[billKey]) || 0;
             } else {
-              const baseQty = Math.floor(Number(e.baseQuantity) || 0);
-              const participantIds = Array.isArray(e.participantMemberIds) && e.participantMemberIds.length > 0
-                ? e.participantMemberIds.map(String)
-                : (Array.isArray(e.splitMemberIds) && e.splitMemberIds.length > 0 ? e.splitMemberIds.map(String) : []);
-
-              if (baseQty > 0 && participantIds.length > 0) {
-                const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
-                const isPart = uniqueParticipants.includes(mId) || uniqueParticipants.includes(userId);
-                if (isPart) {
-                  due += Math.round(((baseQty * pricePerUnit) / uniqueParticipants.length) * 100) / 100;
-                }
-                const extrasMap = e.participantQuantities || e.extras || {};
-                const extraCount = parseInt(extrasMap[mId] ?? extrasMap[userId] ?? 0, 10) || 0;
-                if (extraCount > 0) due += extraCount * pricePerUnit;
-              } else if (participantIds.length > 0) {
-                const isPart = participantIds.includes(mId) || participantIds.includes(userId);
-                if (isPart) {
-                  const extrasMap = e.participantQuantities || e.extras || {};
-                  const count = Math.max(1, parseInt(extrasMap[mId] ?? extrasMap[userId] ?? 1, 10) || 1);
-                  due = count * pricePerUnit;
-                }
-              } else if (Array.isArray(e.participants) && e.participants.length > 0) {
-                const isPart = e.participants.some((p) => String(p.memberId || p._id || p.userId) === mId || String(p.memberId || p._id || p.userId) === userId);
-                if (isPart) {
-                  const total = Number(e.totalCost ?? e.totalPrice ?? (pricePerUnit * e.participants.length));
-                  due = Math.round((total / e.participants.length) * 100) / 100;
-                }
-              } else if (g.members.length > 1) {
-                const total = Number(e.totalCost ?? e.totalPrice ?? (pricePerUnit * (e.quantity || 1)));
-                due = Math.round((total / g.members.length) * 100) / 100;
-              } else if (g.members.length <= 1) {
-                due = Number(e.totalCost ?? e.totalPrice ?? pricePerUnit);
-              }
+              const total = Number(e.totalCost ?? e.totalPrice ?? 0);
+              due = g.members.length > 1 ? total / g.members.length : total;
             }
 
             if (due > 0) {

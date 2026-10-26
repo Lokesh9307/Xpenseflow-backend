@@ -6,7 +6,7 @@ const Budget = require('../models/Budget');
 const Category = require('../models/Category');
 const TiffinGroup = require('../models/TiffinGroup');
 const TiffinEntry = require('../models/TiffinEntry');
-const { parseTiffinTitle, dateKey, buildUserTiffinTruth } = require('../lib/tiffinBills');
+const { tiffinExpenseTruthKey, buildUserTiffinTruth } = require('../lib/tiffinBills');
 
 const { autoProcessRecurringExpenses } = require('./recurring');
 
@@ -47,10 +47,9 @@ async function reconcileTiffinRows(userId, userEmail, expenses) {
       out.push(e);
       continue;
     }
-    const parsed = parseTiffinTitle(e.title);
-    const key = parsed ? `${parsed.groupName}|${parsed.meal}|${dateKey(e.date)}` : null;
+    const key = tiffinExpenseTruthKey(e);
     if (key && truth.has(key)) {
-      if (seen.has(key)) continue; // duplicate copy of the same meal/day
+      if (seen.has(key)) continue; // duplicate copy of the same meal entry
       seen.add(key);
       out.push({ ...e, amount: truth.get(key), category: 'Tiffin Expense' });
     } else {

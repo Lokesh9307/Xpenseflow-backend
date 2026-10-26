@@ -8,8 +8,35 @@ const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
 // Helper to calculate exact per-person bills from any entry (supporting web shared-split & legacy)
 function calculateEntryBills(entry, pricePerUnit, groupMembers = []) {
-  const price = Number(entry.pricePerTiffin || entry.price || pricePerUnit || 100);
   const bills = {};
+  const savedPrice = Number(entry.pricePerTiffin || entry.price);
+  const baseQty = Math.floor(Number(entry.baseQuantity) || 0);
+  const participantIds = Array.isArray(entry.participantMemberIds) && entry.participantMemberIds.length > 0
+    ? entry.participantMemberIds.map(String)
+    : (Array.isArray(entry.splitMemberIds) && entry.splitMemberIds.length > 0 ? entry.splitMemberIds.map(String) : []);
+  const extrasMap = entry.participantQuantities || entry.extras || {};
+  const recordedTotal = Number(entry.totalCost ?? entry.totalPrice);
+
+  let recordedQuantity = 0;
+  if (baseQty > 0 && participantIds.length > 0) {
+    recordedQuantity = baseQty + Object.values(extrasMap).reduce(
+      (sum, value) => sum + Math.max(0, Math.floor(Number(value) || 0)),
+      0
+    );
+  } else if (participantIds.length > 0) {
+    recordedQuantity = [...new Set(participantIds.filter(Boolean))].reduce(
+      (sum, id) => sum + Math.max(1, Math.floor(Number(extrasMap[id]) || 1)),
+      0
+    );
+  }
+
+  // Legacy entries may not have a unit-price snapshot. Derive it from their
+  // recorded total instead of applying today's group price to past meals.
+  const recordedUnitPrice =
+    !savedPrice && Number.isFinite(recordedTotal) && recordedQuantity > 0
+      ? Math.max(0, (recordedTotal - (Number(entry.extraPrice) || 0)) / recordedQuantity)
+      : 0;
+  const price = savedPrice || recordedUnitPrice || Number(pricePerUnit) || 100;
 
   // 1. If explicit memberBills is populated
   if (entry.memberBills && Object.keys(entry.memberBills).length > 0) {
@@ -22,16 +49,9 @@ function calculateEntryBills(entry, pricePerUnit, groupMembers = []) {
   }
 
   // 2. Web shared-split model: baseQuantity > 0 and participantMemberIds
-  const baseQty = Math.floor(Number(entry.baseQuantity) || 0);
-  const participantIds = Array.isArray(entry.participantMemberIds) && entry.participantMemberIds.length > 0
-    ? entry.participantMemberIds.map(String)
-    : (Array.isArray(entry.splitMemberIds) && entry.splitMemberIds.length > 0 ? entry.splitMemberIds.map(String) : []);
-
   if (baseQty > 0 && participantIds.length > 0) {
     const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
     const baseShare = Math.round(((baseQty * price) / uniqueParticipants.length) * 100) / 100;
-    const extrasMap = entry.participantQuantities || entry.extras || {};
-
     uniqueParticipants.forEach((pid) => {
       bills[pid] = (bills[pid] || 0) + baseShare;
     });
@@ -49,7 +69,6 @@ function calculateEntryBills(entry, pricePerUnit, groupMembers = []) {
   // 3. Web per-participant quantities / participantMemberIds
   if (participantIds.length > 0) {
     const uniqueParticipants = [...new Set(participantIds.filter(Boolean))];
-    const extrasMap = entry.participantQuantities || entry.extras || {};
     uniqueParticipants.forEach((pid) => {
       const count = Math.max(1, Math.floor(Number(extrasMap[pid]) || 1));
       bills[pid] = Math.round(count * price * 100) / 100;
@@ -190,14 +209,26 @@ function parseTiffinTitle(title) {
   return { meal: m[1].toLowerCase(), groupName: m[2] };
 }
 
+function tiffinExpenseTruthKey(expense) {
+  const canonicalRef = String(expense.syncRefId || '').match(
+    /^tiffin_([a-f\d]{24})_([a-f\d]{24})(?:_|$)/i
+  );
+  if (canonicalRef) return `entry:${canonicalRef[2]}:${canonicalRef[1]}`;
+
+  const parsed = parseTiffinTitle(expense.title);
+  return parsed
+    ? `legacy:${parsed.groupName}|${parsed.meal}|${dateKey(expense.date)}`
+    : null;
+}
+
 /**
  * Resolve the user's true per-meal share from the TIFFIN TRACKER itself.
- * Returns a Map of `${groupName}|${meal}|${YYYY-MM-DD}` → user's bill (₹),
- * skipping no-tiffin markers. This is the source of truth the Expense
- * Tracker's Tiffin category is reconciled against.
+ * Returns a Map keyed by stable group/entry IDs, with an unambiguous
+ * title/date fallback for legacy expense rows, skipping no-tiffin markers.
  */
 function buildUserTiffinTruth(groups, entries, userId, userEmail) {
   const truth = new Map();
+  const legacyValues = new Map();
   const uid = String(userId);
   const email = String(userEmail || '').toLowerCase().trim();
 
@@ -228,10 +259,22 @@ function buildUserTiffinTruth(groups, entries, userId, userEmail) {
         bill = members.length > 1 ? total / members.length : total;
       }
 
-      const key = `${g.name}|${String(norm.mealType || '').toLowerCase()}|${dateKey(norm.date)}`;
-      truth.set(key, round2(bill));
+      const amount = round2(bill);
+      truth.set(`entry:${g._id}:${e._id}`, amount);
+
+      const legacyKey =
+        `${g.name}|${String(norm.mealType || '').toLowerCase()}|${dateKey(norm.date)}`;
+      const matches = legacyValues.get(legacyKey) || [];
+      matches.push(amount);
+      legacyValues.set(legacyKey, matches);
     }
   }
+
+  // Title/date matching is only safe when exactly one group-entry can match.
+  for (const [key, values] of legacyValues) {
+    if (values.length === 1) truth.set(`legacy:${key}`, values[0]);
+  }
+
   return truth;
 }
 
@@ -243,5 +286,6 @@ module.exports = {
   toUtcMidnight,
   dateKey,
   parseTiffinTitle,
+  tiffinExpenseTruthKey,
   buildUserTiffinTruth,
 };

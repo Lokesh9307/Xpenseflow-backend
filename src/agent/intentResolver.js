@@ -8,6 +8,7 @@
 
 const { AGENT_TOOLS } = require('./toolDefinitions');
 const { resolveNavigation } = require('./navigationRegistry');
+const { validateRegisteredToolCall } = require('./toolRegistry');
 
 const SYSTEM_PROMPT = `You are ExpenseBot, a production-grade, highly reliable AI financial assistant for the XpenseFlow mobile application.
 Your goal is to parse user intents accurately and call the appropriate tool.
@@ -18,41 +19,14 @@ Rules:
 3. If user states a date explicitly (e.g., "yesterday", "last friday", "on Oct 12"), set isExplicitDate to true. If today is inferred, set isExplicitDate to false.
 4. For navigation requests (e.g., "open expenses", "show reports", "take me to tiffin", "where can I logout"), call navigate_app.
 5. If crucial information like amount is missing for an expense, use request_clarification.
-6. Available primary navigation screens: Expenses, Analytics, MainTabs, TiffinTransactions, SplitTransactions, Recurring, Profile, ExpenseTrackerSettings.
+6. Available primary navigation screens must come from the supplied trusted application context.
 7. Available payment methods: UPI, Cash, Credit Card, Debit Card, Net Banking. Default to UPI.`;
 
 /**
  * Validates tool call parameters at runtime.
  */
 function validateToolCall(toolName, params) {
-  if (!params || typeof params !== 'object') return false;
-
-  switch (toolName) {
-    case 'create_expense':
-      return typeof params.amount === 'number' && params.amount > 0;
-    case 'query_expenses':
-    case 'query_budget':
-    case 'query_splits':
-    case 'query_tiffin':
-    case 'undo_last_expense':
-      return true;
-    case 'update_expense':
-      return typeof params.targetQuery === 'string' && typeof params.updates === 'object';
-    case 'delete_expense':
-      return typeof params.targetQuery === 'string';
-    case 'create_split':
-      return typeof params.amount === 'number' && params.amount > 0;
-    case 'log_tiffin':
-      return typeof params.mealType === 'string';
-    case 'navigate_app':
-      return typeof params.screenTarget === 'string' && params.screenTarget.length > 0;
-    case 'request_clarification':
-      return typeof params.question === 'string' && Array.isArray(params.options);
-    case 'general_answer':
-      return typeof params.response === 'string';
-    default:
-      return false;
-  }
+  return validateRegisteredToolCall(toolName, params);
 }
 
 /**
@@ -243,6 +217,12 @@ async function resolveIntent(message, history = [], options = {}) {
       role: h.role === 'user' ? 'user' : 'assistant',
       content: typeof h.content === 'string' ? h.content : JSON.stringify(h.content),
     }));
+    const contextText = options.trustedContext
+      ? `\n\nTrusted application context (do not infer beyond these values):\n${JSON.stringify(options.trustedContext)}`
+      : '';
+    const skillText = options.skillInstructions
+      ? `\n\nFollow only these loaded domain instructions in addition to the global rules:\n${options.skillInstructions}`
+      : '';
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 12000);
@@ -256,7 +236,10 @@ async function resolveIntent(message, history = [], options = {}) {
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          {
+            role: 'system',
+            content: `${SYSTEM_PROMPT}${contextText}${skillText}\n\nInterpret the whole request before acting. If multiple actions are explicitly requested, return tool calls in dependency order. Never execute or propose a mutation for negated, hypothetical, or merely quoted instructions.`,
+          },
           ...formattedHistory,
           { role: 'user', content: message },
         ],
@@ -278,26 +261,46 @@ async function resolveIntent(message, history = [], options = {}) {
     const data = await res.json();
     const choice = data.choices?.[0];
 
-    // 1. Tool Call received from model
+    // 1. Tool calls received from model. Validate the complete proposed plan.
     if (choice?.message?.tool_calls && choice.message.tool_calls.length > 0) {
-      const toolCall = choice.message.tool_calls[0];
-      const toolName = toolCall.function?.name;
-      let toolArgs = {};
-
-      try {
-        toolArgs = JSON.parse(toolCall.function?.arguments || '{}');
-      } catch (e) {
-        console.warn('[IntentResolver] Could not parse tool arguments JSON:', e);
+      const actions = [];
+      for (const toolCall of choice.message.tool_calls) {
+        const toolName = toolCall.function?.name;
+        let toolArgs;
+        try {
+          toolArgs = JSON.parse(toolCall.function?.arguments || '{}');
+        } catch (e) {
+          console.warn('[IntentResolver] Could not parse tool arguments JSON:', e);
+          return {
+            toolName: 'request_clarification',
+            params: {
+              question: 'I could not safely understand that action. Could you rephrase it?',
+              options: [],
+              missingField: 'request',
+            },
+            isInferred: false,
+          };
+        }
+        if (!validateToolCall(toolName, toolArgs)) {
+          return {
+            toolName: 'request_clarification',
+            params: {
+              question: 'I could not validate the requested action. Please clarify what you want me to do.',
+              options: [],
+              missingField: 'request',
+            },
+            isInferred: false,
+          };
+        }
+        actions.push({ toolName, params: toolArgs });
       }
 
-      if (validateToolCall(toolName, toolArgs)) {
-        return {
-          toolName,
-          params: toolArgs,
-          isInferred: false,
-          modelReasoning: choice.message?.reasoning || null,
-        };
-      }
+      return {
+        ...actions[0],
+        actions,
+        isInferred: false,
+        modelReasoning: choice.message?.reasoning || null,
+      };
     }
 
     // 2. Direct Content Response from model
