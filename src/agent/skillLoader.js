@@ -1,8 +1,28 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { getSkillConfig } = require('./skillRegistry');
+const bundledSkills = require('./bundledSkills');
 
-const SKILLS_ROOT = path.resolve(__dirname, '../../../skills');
+function resolveSkillsRoot() {
+  const candidates = [
+    process.env.SKILLS_DIR,
+    path.resolve(__dirname, '../../../skills'),
+    path.resolve(__dirname, '../../skills'),
+    path.resolve(process.cwd(), 'skills'),
+    path.resolve(process.cwd(), '../skills'),
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    try {
+      if (fs.existsSync(dir) && fs.existsSync(path.join(dir, 'xpenseflow-core', 'SKILL.md'))) {
+        return dir;
+      }
+    } catch {
+      // continue candidate search
+    }
+  }
+  return null;
+}
 
 function readSkillDocument(skillId, relativePath) {
   const config = getSkillConfig(skillId);
@@ -13,12 +33,29 @@ function readSkillDocument(skillId, relativePath) {
     throw new Error(`Unregistered skill document: ${skillId}/${relativePath}`);
   }
 
-  const skillRoot = path.resolve(SKILLS_ROOT, skillId);
-  const filePath = path.resolve(skillRoot, relativePath);
-  if (!filePath.startsWith(`${skillRoot}${path.sep}`)) {
-    throw new Error(`Invalid skill document path: ${relativePath}`);
+  const normalizedRel = relativePath.replace(/\\/g, '/');
+  const bundleKey = `${skillId}/${normalizedRel}`;
+
+  const root = resolveSkillsRoot();
+  if (root) {
+    try {
+      const skillRoot = path.resolve(root, skillId);
+      const filePath = path.resolve(skillRoot, relativePath);
+      if (filePath.startsWith(`${skillRoot}${path.sep}`) || filePath === skillRoot || filePath.startsWith(skillRoot)) {
+        if (fs.existsSync(filePath)) {
+          return fs.readFileSync(filePath, 'utf8');
+        }
+      }
+    } catch {
+      // fallback to bundled skills below
+    }
   }
-  return fs.readFileSync(filePath, 'utf8');
+
+  if (bundledSkills && Object.prototype.hasOwnProperty.call(bundledSkills, bundleKey)) {
+    return bundledSkills[bundleKey];
+  }
+
+  throw new Error(`Skill document not found: ${bundleKey}`);
 }
 
 function validateSkillFrontmatter(skillId, content) {

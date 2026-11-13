@@ -195,6 +195,7 @@ router.get('/groups', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const groups = await SplitGroup.find({
+      archived: { $ne: true },
       $or: [{ createdBy: userId }, { 'members.userId': userId }],
     }).sort({ updatedAt: -1 });
 
@@ -302,6 +303,137 @@ router.get('/groups/:id', auth, async (req, res) => {
     });
   } catch (err) {
     console.error('GET /api/split/groups/:id error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// POST /api/split/groups/:id/members — add member manually without invite
+router.post('/groups/:id/members', auth, async (req, res) => {
+  try {
+    const userId = String(req.user.id);
+    const groupId = req.params.id;
+    const { name, email } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Member name is required' });
+    }
+
+    const group = await SplitGroup.findById(groupId);
+    if (!group) return res.status(404).json({ message: 'Group not found' });
+
+    const isMember =
+      String(group.createdBy) === userId ||
+      group.members.some((m) => idStr(m.userId) === userId);
+    if (!isMember) return res.status(403).json({ message: 'Access denied' });
+
+    const normalizedName = name.trim();
+    const existing = group.members.find(
+      (m) => m.name && m.name.toLowerCase() === normalizedName.toLowerCase()
+    );
+    if (existing) {
+      return res.status(400).json({ message: `Member "${normalizedName}" already exists in this group` });
+    }
+
+    let registeredUserId = null;
+    if (email && email.trim()) {
+      const registeredUser = await User.findOne({ email: email.trim().toLowerCase() }).select('_id');
+      if (registeredUser) {
+        registeredUserId = registeredUser._id;
+        if (group.members.some((m) => idStr(m.userId) === String(registeredUserId))) {
+          return res.status(400).json({ message: 'User with this email is already a member' });
+        }
+      }
+    }
+
+    const mongoose = require('mongoose');
+    const newMember = {
+      userId: registeredUserId || new mongoose.Types.ObjectId(),
+      name: normalizedName,
+      email: email ? email.trim() : undefined,
+      role: 'member',
+      joinedAt: new Date(),
+      reliabilityScore: 100,
+    };
+
+    group.members.push(newMember);
+    await group.save();
+
+    const populated = await SplitGroup.findById(groupId)
+      .populate('members.userId', 'name email avatar')
+      .populate('createdBy', 'name email avatar');
+
+    return res.status(201).json({
+      message: 'Member added successfully',
+      member: newMember,
+      group: populated,
+    });
+  } catch (err) {
+    console.error('POST /api/split/groups/:id/members error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// DELETE /api/split/groups/:id — delete/archive split group
+router.delete('/groups/:id', auth, async (req, res) => {
+  try {
+    const userId = String(req.user.id);
+    const groupId = req.params.id;
+
+    const group = await SplitGroup.findById(groupId);
+    if (!group) return res.status(404).json({ message: 'Group not found' });
+
+    const isCreator = String(group.createdBy) === userId;
+    const isAdmin = group.members.some((m) => idStr(m.userId) === userId && m.role === 'admin');
+    if (!isCreator && !isAdmin) {
+      return res.status(403).json({ message: 'Only group creator or admin can delete the group' });
+    }
+
+    group.archived = true;
+    await group.save();
+
+    await SplitInvite.updateMany({ groupId }, { $set: { revoked: true } }).catch(() => {});
+
+    return res.json({ message: 'Group deleted successfully', groupId });
+  } catch (err) {
+    console.error('DELETE /api/split/groups/:id error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// DELETE /api/split/groups/:id/members/:memberId — remove member from group
+router.delete('/groups/:id/members/:memberId', auth, async (req, res) => {
+  try {
+    const userId = String(req.user.id);
+    const { id: groupId, memberId } = req.params;
+
+    const group = await SplitGroup.findById(groupId);
+    if (!group) return res.status(404).json({ message: 'Group not found' });
+
+    const isCreator = String(group.createdBy) === userId;
+    const isAdmin = group.members.some((m) => idStr(m.userId) === userId && m.role === 'admin');
+    if (!isCreator && !isAdmin) {
+      return res.status(403).json({ message: 'Only group creator or admin can remove members' });
+    }
+
+    if (String(group.createdBy) === memberId) {
+      return res.status(400).json({ message: 'Cannot remove the group creator' });
+    }
+
+    const initialLen = group.members.length;
+    group.members = group.members.filter(
+      (m) => String(m._id) !== memberId && idStr(m.userId) !== memberId
+    );
+
+    if (group.members.length === initialLen) {
+      return res.status(404).json({ message: 'Member not found in group' });
+    }
+
+    await group.save();
+    await recomputeSplitBalances(groupId);
+
+    return res.json({ message: 'Member removed successfully', group });
+  } catch (err) {
+    console.error('DELETE /api/split/groups/:id/members/:memberId error:', err);
     return res.status(500).json({ message: err.message || 'Server error' });
   }
 });
