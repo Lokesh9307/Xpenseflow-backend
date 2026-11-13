@@ -86,6 +86,36 @@ function parseDateParam(dateStr) {
     return d;
   }
 
+  const daysAgo = lower.match(/^(\d{1,3})\s+days?\s+ago$/i);
+  if (daysAgo) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - Number(daysAgo[1]));
+    return d;
+  }
+
+  const numeric = lower.match(/^(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?$/);
+  if (numeric) {
+    const day = Number(numeric[1]);
+    const month = Number(numeric[2]);
+    let year = numeric[3] ? Number(numeric[3]) : now.getFullYear();
+    if (year < 100) year += 2000;
+    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+      return new Date(year, month - 1, day, 12, 0, 0, 0);
+    }
+  }
+
+  const weekdayMatch = lower.match(/^(?:last\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/i);
+  if (weekdayMatch) {
+    const target = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+      .indexOf(weekdayMatch[1].toLowerCase());
+    const d = new Date(now);
+    const current = d.getDay();
+    let delta = current - target;
+    if (delta <= 0) delta += 7;
+    d.setDate(d.getDate() - delta);
+    return d;
+  }
+
   const parsed = new Date(dateStr);
   return parsed;
 }
@@ -245,13 +275,51 @@ async function executeTool(toolName, params = {}, context = {}) {
           category: params.category,
           month: params.month,
           search: params.search,
+          startDate: params.startDate,
+          endDate: params.endDate,
           limit: params.limit,
         });
 
+        if (params.comparePreviousMonth) {
+          const [year, monthNumber] = String(params.month || '').split('-').map(Number);
+          const base = year && monthNumber
+            ? new Date(year, monthNumber - 1, 1)
+            : new Date();
+          const previous = new Date(base.getFullYear(), base.getMonth() - 1, 1);
+          const previousKey = `${previous.getFullYear()}-${String(previous.getMonth() + 1).padStart(2, '0')}`;
+          const previousSummary = await queryExpensesSummary({
+            userId,
+            category: params.category,
+            month: previousKey,
+            limit: params.limit,
+          });
+          const difference = Math.round((summary.totalAmount - previousSummary.totalAmount) * 100) / 100;
+          const direction = difference > 0 ? 'more' : difference < 0 ? 'less' : 'the same';
+          const message = difference === 0
+            ? `You spent the same this month and last month: ₹${summary.totalAmount.toLocaleString()} each.`
+            : `You spent ₹${Math.abs(difference).toLocaleString()} ${direction} this month than last month (₹${summary.totalAmount.toLocaleString()} vs ₹${previousSummary.totalAmount.toLocaleString()}).`;
+
+          executionResult = {
+            success: true,
+            intent: 'expense.compare',
+            verifiedData: { current: summary, previous: previousSummary, difference },
+            message,
+          };
+          break;
+        }
+
         let summaryText = `Found ${summary.count} transaction(s) totaling ₹${summary.totalAmount.toLocaleString()}`;
         if (summary.period) summaryText += ` for ${summary.period}`;
-        if (summary.topCategory) {
+
+        if (params.focus === 'largest_expense' && summary.largestExpense) {
+          summaryText = `Your largest expense was **${summary.largestExpense.title}** at ₹${Number(summary.largestExpense.amount).toLocaleString()} (${summary.largestExpense.category || 'Others'}).`;
+        } else if (params.focus === 'top_category' && summary.topCategory) {
+          summaryText = `Most of your spending went to **${summary.topCategory.name}** — ₹${summary.topCategory.amount.toLocaleString()} of ₹${summary.totalAmount.toLocaleString()}.`;
+        } else if (summary.topCategory) {
           summaryText += `. Top spending was in **${summary.topCategory.name}** (₹${summary.topCategory.amount.toLocaleString()}).`;
+        }
+        if (!summary.count) {
+          summaryText = `I found no expenses for ${summary.period || 'that period'}.`;
         }
 
         executionResult = {
@@ -572,14 +640,45 @@ async function executeTool(toolName, params = {}, context = {}) {
         }
         const count = parseInt(params.count, 10) || 1;
 
-        let group = await TiffinGroup.findOne({
-          $or: [{ createdBy: userId }, { 'members.userId': userId }],
-          archived: { $ne: true },
-        });
+        let group = null;
+        if (params.groupId) {
+          group = await TiffinGroup.findOne({
+            _id: params.groupId,
+            $or: [{ createdBy: userId }, { 'members.userId': userId }],
+            archived: { $ne: true },
+          });
+        }
+        if (!group && params.groupName) {
+          const cleanSearch = params.groupName.trim();
+          const escaped = cleanSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          group = await TiffinGroup.findOne({
+            $or: [{ createdBy: userId }, { 'members.userId': userId }],
+            name: { $regex: new RegExp(escaped, 'i') },
+            archived: { $ne: true },
+          });
+          if (!group) {
+            const userGroups = await TiffinGroup.find({
+              $or: [{ createdBy: userId }, { 'members.userId': userId }],
+              archived: { $ne: true },
+            });
+            const searchTokens = cleanSearch.toLowerCase().split(/\s+/).filter(Boolean);
+            group = userGroups.find((g) => {
+              const gName = (g.name || '').toLowerCase();
+              return searchTokens.every((token) => gName.includes(token)) ||
+                     searchTokens.some((token) => gName.includes(token));
+            }) || null;
+          }
+        }
+        if (!group) {
+          group = await TiffinGroup.findOne({
+            $or: [{ createdBy: userId }, { 'members.userId': userId }],
+            archived: { $ne: true },
+          });
+        }
 
         if (!group) {
           group = await TiffinGroup.create({
-            name: 'Daily Tiffin',
+            name: params.groupName ? params.groupName.trim() : 'Daily Tiffin',
             defaultPrice: 80,
             pricePerTiffin: 80,
             createdBy: userId,
@@ -590,16 +689,60 @@ async function executeTool(toolName, params = {}, context = {}) {
         const unitPrice = group.defaultPrice || group.pricePerTiffin || 80;
         const totalPrice = unitPrice * count;
 
+        const memberCount = group.members?.length || 1;
+        const shouldSplit = params.splitBetweenAll === true || (memberCount > 1 && /between|split|among/i.test(rawMessage));
+        const splitMemberIds = shouldSplit && group.members && group.members.length > 0
+          ? group.members.map((m) => String(m._id || m.userId))
+          : [String(userId)];
+
+        const perPersonShare = shouldSplit && memberCount > 0 ? Math.round((totalPrice / memberCount) * 100) / 100 : totalPrice;
+        const memberBills = {};
+        const participants = [];
+        if (shouldSplit && group.members) {
+          for (const m of group.members) {
+            const mId = String(m._id || m.userId);
+            memberBills[mId] = perPersonShare;
+            participants.push({
+              memberId: mId,
+              name: m.name || 'Member',
+              quantity: 1,
+            });
+          }
+        }
+
         const entry = await TiffinEntry.create({
           groupId: group._id,
           userId,
+          addedBy: userId,
           date: mealDate,
           mealType,
           quantity: count,
           count,
+          baseQuantity: count,
+          pricePerTiffin: unitPrice,
+          totalCost: totalPrice,
           totalPrice,
+          perPersonShare,
+          splitMemberIds,
+          memberBills,
+          participants,
           notes: params.notes || '',
         });
+
+        // Auto-sync into Expense Tracker so transaction is immediately visible to the user
+        try {
+          const tiffinRoutes = require('../routes/tiffin');
+          if (typeof tiffinRoutes.syncTiffinEntryExpenses === 'function') {
+            await tiffinRoutes.syncTiffinEntryExpenses(entry, group, { forceUserSync: userId });
+          }
+        } catch (syncErr) {
+          console.warn('[ToolExecutor] tiffin sync warning:', syncErr.message);
+        }
+
+        const splitSuffix = shouldSplit && memberCount > 1
+          ? ` split between all ${memberCount} members (₹${Math.round(perPersonShare)} each)`
+          : '';
+        const formattedDate = mealDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
 
         executionResult = {
           success: true,
@@ -609,10 +752,12 @@ async function executeTool(toolName, params = {}, context = {}) {
             mealType: entry.mealType,
             quantity: count,
             totalPrice,
+            perPersonShare,
             date: entry.date.toISOString(),
             groupName: group.name,
+            splitBetweenAll: shouldSplit,
           },
-          message: `Logged ${count} ${mealType} tiffin (₹${totalPrice}) for ${mealDate.toLocaleDateString()}.`,
+          message: `Logged ${count} ${mealType} tiffin (₹${totalPrice}) for ${group.name}${splitSuffix} on ${formattedDate}. Added to your transactions and tiffin ledger.`,
         };
         break;
       }

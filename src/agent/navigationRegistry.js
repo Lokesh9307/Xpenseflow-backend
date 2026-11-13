@@ -15,7 +15,7 @@ const ALLOWED_SCREENS = {
     title: 'All Expenses',
     tab: 'ExpensesTxns',
     description: 'View full transaction history, search and filter expenses',
-    aliases: ['expenses', 'expense list', 'transaction list', 'transactions', 'txns', 'all expenses', 'view expenses', 'open expenses'],
+    aliases: ['expenses', 'expense list', 'transaction list', 'transactions', 'txns', 'all expenses', 'view expenses', 'open expenses', 'add expense', 'add an expense', 'add an expense screen', 'add expense screen', 'new expense'],
   },
   Analytics: {
     screenId: 'Analytics',
@@ -57,13 +57,13 @@ const ALLOWED_SCREENS = {
     title: 'Account & Settings',
     tab: 'ProfileTab',
     description: 'Manage account profile, preferences, and security. Sign out can be accessed safely here.',
-    aliases: ['profile', 'account', 'sign out', 'logout', 'log out', 'user details', 'where can i sign out', 'where do i logout'],
+    aliases: ['profile', 'account', 'sign out', 'logout', 'log out', 'log me out', 'sign me out', 'user details', 'where can i sign out', 'where do i logout'],
   },
   ExpenseTrackerSettings: {
     screenId: 'ExpenseTrackerSettings',
     title: 'Tracker Settings',
     description: 'Customize category thresholds, budgets, and display settings',
-    aliases: ['settings', 'tracker settings', 'app settings', 'budget settings', 'preferences'],
+    aliases: ['settings', 'tracker settings', 'app settings', 'budget settings', 'budgets', 'budget page', 'preferences', 'change password', 'change my password', 'password'],
   },
   TiffinSettings: {
     screenId: 'TiffinSettings',
@@ -132,7 +132,7 @@ function resolveNavigation(input) {
   }
 
   // 3. Substring match ONLY if navigation intent verb is present or exact word boundary matches
-  const hasNavVerb = /\b(open|show|go to|take me to|navigate to|view|where is|where do i|where can i|head to|jump to)\b/i.test(clean);
+  const hasNavVerb = /\b(open|show|go to|take me to|navigate to|view|where is|where do i|where can i|head to|jump to|log\s*(?:me\s*)?out|sign\s*(?:me\s*)?out|change\s*(?:my\s*)?password)\b/i.test(clean);
   if (hasNavVerb) {
     for (const item of allAliases) {
       const regex = new RegExp(`\\b${item.alias.replace(/\s+/g, '\\s+')}\\b`, 'i');

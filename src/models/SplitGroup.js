@@ -4,6 +4,7 @@ const splitGroupSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
     photoUrl: { type: String },
+    inviteCode: { type: String, trim: true },
     currency: { type: String, default: 'INR' },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     defaultSplitType: {

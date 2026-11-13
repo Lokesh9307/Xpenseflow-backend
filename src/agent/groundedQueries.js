@@ -19,6 +19,31 @@ const TiffinGroup = require('../models/TiffinGroup');
 // High-speed in-memory RAM cache for repeated financial read queries (30s TTL)
 const queryCache = new Map();
 const QUERY_CACHE_TTL_MS = 30 * 1000;
+const MAX_AGGREGATION_ROWS = 2000;
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeMonth(month) {
+  if (!month) return '';
+  const value = String(month).trim().toLowerCase();
+  const now = new Date();
+  if (value === 'this month' || value === 'current month') {
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  }
+  if (value === 'last month' || value === 'previous month') {
+    const previous = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    return `${previous.getFullYear()}-${String(previous.getMonth() + 1).padStart(2, '0')}`;
+  }
+  if (/^\d{4}-\d{1,2}$/.test(value)) {
+    const [year, monthNumber] = value.split('-').map(Number);
+    if (year && monthNumber >= 1 && monthNumber <= 12) {
+      return `${year}-${String(monthNumber).padStart(2, '0')}`;
+    }
+  }
+  return value;
+}
 
 function invalidateUserQueryCache(userId) {
   if (!userId) return;
@@ -34,7 +59,8 @@ function invalidateUserQueryCache(userId) {
  * Deterministic calculation of expense totals, counts, and category breakdowns.
  */
 async function queryExpensesSummary({ userId, category, month, search, startDate, endDate, limit = 100 }) {
-  const cacheKey = `${userId}:exp:${category || ''}:${month || ''}:${search || ''}:${startDate || ''}:${endDate || ''}:${limit}`;
+  const normalizedMonth = normalizeMonth(month);
+  const cacheKey = `${userId}:exp:${category || ''}:${normalizedMonth || ''}:${search || ''}:${startDate || ''}:${endDate || ''}:${limit}`;
   const now = Date.now();
   const cached = queryCache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
@@ -43,15 +69,15 @@ async function queryExpensesSummary({ userId, category, month, search, startDate
   const query = { userId };
 
   if (category && category !== 'All') {
-    query.category = new RegExp(`^${category.trim()}$`, 'i');
+    query.category = new RegExp(`^${escapeRegex(category.trim())}$`, 'i');
   }
 
   if (search) {
-    query.title = { $regex: search.trim(), $options: 'i' };
+    query.title = { $regex: escapeRegex(search.trim()), $options: 'i' };
   }
 
-  if (month && month !== 'all') {
-    const [year, m] = month.split('-').map(Number);
+  if (normalizedMonth && normalizedMonth !== 'all') {
+    const [year, m] = normalizedMonth.split('-').map(Number);
     if (year && m) {
       const startOfMonth = new Date(Date.UTC(year, m - 1, 1, 0, 0, 0, 0));
       const endOfMonth = new Date(Date.UTC(year, m, 1, 0, 0, 0, 0));
@@ -63,7 +89,10 @@ async function queryExpensesSummary({ userId, category, month, search, startDate
     if (endDate) query.date.$lte = new Date(endDate);
   }
 
-  const expenses = await Expense.find(query).sort({ date: -1 }).limit(parseInt(limit, 10) || 100);
+  // Aggregate over the complete matching set, then limit only the preview.
+  // The previous code limited the aggregation itself, which under-reported
+  // totals once a month had more rows than the requested preview limit.
+  const expenses = await Expense.find(query).sort({ date: -1 }).limit(MAX_AGGREGATION_ROWS);
 
   let totalAmount = 0;
   const byCategory = {};
@@ -85,14 +114,29 @@ async function queryExpensesSummary({ userId, category, month, search, startDate
     .map(([name, amount]) => ({ name, amount: Math.round(amount * 100) / 100 }))
     .sort((a, b) => b.amount - a.amount);
 
+  const largest = expenses.reduce((best, current) => {
+    if (!best) return current;
+    return Number(current.amount) > Number(best.amount) ? current : best;
+  }, null);
+
   const result = {
     totalAmount: Math.round(totalAmount * 100) / 100,
     count: expenses.length,
-    period: month || (startDate && endDate ? `${startDate} to ${endDate}` : 'All time'),
+    period: normalizedMonth || (startDate && endDate ? `${startDate} to ${endDate}` : 'All time'),
     topCategory: sortedCategories[0] || null,
+    largestExpense: largest
+      ? {
+          id: String(largest._id),
+          title: largest.title,
+          amount: largest.amount,
+          category: largest.category,
+          date: largest.date,
+          paymentMethod: largest.paymentMethod,
+        }
+      : null,
     categoryBreakdown: sortedCategories,
     paymentMethodBreakdown: byPaymentMethod,
-    recentExpenses: expenses.slice(0, 5).map((e) => ({
+    recentExpenses: expenses.slice(0, Math.max(1, Math.min(20, parseInt(limit, 10) || 5))).map((e) => ({
       id: String(e._id),
       title: e.title,
       amount: e.amount,
@@ -118,7 +162,7 @@ async function queryBudgetStatus({ userId, month, category }) {
   }
 
   const dateNow = new Date();
-  const targetMonth = month || `${dateNow.getFullYear()}-${String(dateNow.getMonth() + 1).padStart(2, '0')}`;
+  const targetMonth = normalizeMonth(month) || `${dateNow.getFullYear()}-${String(dateNow.getMonth() + 1).padStart(2, '0')}`;
 
   const [year, m] = targetMonth.split('-').map(Number);
   const startOfMonth = new Date(Date.UTC(year, m - 1, 1, 0, 0, 0, 0));

@@ -31,7 +31,7 @@ async function removeTiffinEntryExpenses(entryId, groupId) {
   });
 }
 
-async function syncTiffinEntryExpenses(entry, group) {
+async function syncTiffinEntryExpenses(entry, group, options = {}) {
   const activeSyncRefs = [];
   const normalizedMeal = String(entry.mealType || 'meal');
   const entryBills = calculateEntryBills(
@@ -66,7 +66,11 @@ async function syncTiffinEntryExpenses(entry, group) {
       if (!targetUser && isCreatorMember) {
         targetUser = await User.findById(group.createdBy);
       }
-      if (!targetUser?.autoSyncTiffin) continue;
+
+      const shouldSync = targetUser?.autoSyncTiffin ||
+        (options.forceUserSync && targetUser && String(targetUser._id) === String(options.forceUserSync)) ||
+        options.forceSyncAll;
+      if (!shouldSync) continue;
 
       let tiffinCategory = await Category.findOne({
         userId: targetUser._id,
@@ -892,6 +896,7 @@ router.get('/transactions', auth, async (req, res) => {
 });
 
 module.exports = router;
+router.syncTiffinEntryExpenses = syncTiffinEntryExpenses;
 // Pure helpers exposed for unit tests (no DB required)
 module.exports._helpers = {
   sanitizeSplitPayload,
@@ -899,4 +904,5 @@ module.exports._helpers = {
   toUtcMidnight,
   round2,
   tiffinEntrySyncRefPattern,
+  syncTiffinEntryExpenses,
 };

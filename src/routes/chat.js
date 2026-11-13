@@ -7,13 +7,14 @@ const { planActions } = require('../agent/actionPlanner');
 const { authorizeAction } = require('../agent/policyEngine');
 const { resolveUserCategory } = require('../agent/categoryResolver');
 const { parseDateParam } = require('../agent/toolExecutor');
+const { mergePendingAction } = require('../agent/conversationContext');
 
 // POST /api/chat
 router.post('/', auth, async (req, res) => {
   const startTime = Date.now();
   try {
     const userId = req.user.id;
-    const { message, mode = 'agentic', history = [], requestId, confirmedAction } = req.body;
+    const { message, mode = 'agentic', history = [], requestId, confirmedAction, pendingAction } = req.body;
 
     if (!message && !confirmedAction) {
       return res.status(400).json({ message: 'Message or confirmedAction is required' });
@@ -32,15 +33,17 @@ router.post('/', auth, async (req, res) => {
       const sanitizedAction = confirmedAction.toolName === 'create_expense'
         ? {
             toolName: 'create_expense',
-            params: {
-              amount: confirmedParams.amount,
-              category: confirmedParams.category,
-              title: confirmedParams.title,
-              paymentMethod: confirmedParams.paymentMethod,
-              date: confirmedParams.date,
-              notes: confirmedParams.notes,
-              isExplicitDate: confirmedParams.isExplicitDate,
-            },
+            params: Object.fromEntries(
+              Object.entries({
+                amount: confirmedParams.amount,
+                category: confirmedParams.category,
+                title: confirmedParams.title,
+                paymentMethod: confirmedParams.paymentMethod,
+                date: confirmedParams.date,
+                notes: confirmedParams.notes,
+                isExplicitDate: confirmedParams.isExplicitDate,
+              }).filter(([, value]) => value !== undefined && value !== null && value !== '')
+            ),
           }
         : confirmedAction;
       const plan = planActions([sanitizedAction], '');
@@ -59,8 +62,27 @@ router.post('/', auth, async (req, res) => {
       });
     }
 
+    // A clarification answer (such as a category chip) can complete the
+    // previous create_expense action without asking the model to re-parse it.
+    // Only whitelisted fields are merged, and the resulting action must still
+    // pass registered-tool validation.
+    const mergedFollowUp = mergePendingAction(pendingAction, message);
+    let prepared = null;
+    if (mergedFollowUp) {
+      const followUpPlan = planActions([mergedFollowUp.action], message);
+      if (followUpPlan.valid) {
+        prepared = {
+          skillIds: ['xpenseflow-core', 'expense-management'],
+          trustedContext: {},
+          plan: followUpPlan,
+        };
+      }
+    }
+
     // Route the request through trusted skills, validated context, and a typed action plan.
-    const prepared = await prepareAgentRequest({ userId, message, history, mode });
+    if (!prepared) {
+      prepared = await prepareAgentRequest({ userId, message, history, mode });
+    }
     if (!prepared.plan.valid) {
       return res.json({
         response: prepared.plan.reason,
@@ -119,6 +141,15 @@ router.post('/', auth, async (req, res) => {
             options: ['₹100', '₹250', '₹500', '₹1000'],
             missingField: 'amount',
           },
+          pendingAction: {
+            toolName: 'create_expense',
+            params: {
+              category: params.category || 'Others',
+              title: params.title || '',
+              paymentMethod: params.paymentMethod || 'UPI',
+              date: params.date || new Date().toISOString(),
+            },
+          },
           skillsLoaded: prepared.skillIds,
           latencyMs: Date.now() - startTime,
         });
@@ -160,8 +191,17 @@ router.post('/', auth, async (req, res) => {
           success: false,
           clarification: {
             question: 'What date was this expense made?',
-            options: [],
+            options: ['Today', 'Yesterday'],
             missingField: 'date',
+          },
+          pendingAction: {
+            toolName: 'create_expense',
+            params: {
+              amount,
+              category: catRes.categoryName,
+              title: params.title || '',
+              paymentMethod: params.paymentMethod || 'UPI',
+            },
           },
           skillsLoaded: prepared.skillIds,
           latencyMs: Date.now() - startTime,
@@ -214,7 +254,7 @@ router.post('/', auth, async (req, res) => {
       verifiedData: outcome.verifiedData,
       navigationAction: outcome.navigationAction || null,
       clarification: outcome.clarification || null,
-      pendingAction: outcome.pendingAction || null,
+      pendingAction: outcome.pendingAction || prepared.resolution?.pendingAction || null,
       actionResults: outcomes.length > 1 ? outcomes : undefined,
       skillsLoaded: prepared.skillIds,
       form: outcome.verifiedData && toolName === 'create_expense'

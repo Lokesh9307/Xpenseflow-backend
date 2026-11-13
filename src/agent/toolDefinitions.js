@@ -73,6 +73,23 @@ const AGENT_TOOLS = [
             type: 'number',
             description: 'Max records to return. Default 20.',
           },
+          startDate: {
+            type: 'string',
+            description: 'Inclusive ISO start date for day/week queries.',
+          },
+          endDate: {
+            type: 'string',
+            description: 'Inclusive ISO end date for day/week queries.',
+          },
+          comparePreviousMonth: {
+            type: 'boolean',
+            description: 'When true, compare the requested month with the month before it.',
+          },
+          focus: {
+            type: 'string',
+            enum: ['summary', 'top_category', 'largest_expense'],
+            description: 'Shape the answer around the requested spending insight.',
+          },
         },
       },
     },
@@ -213,6 +230,18 @@ const AGENT_TOOLS = [
           notes: {
             type: 'string',
             description: 'Optional notes regarding the meal.',
+          },
+          groupName: {
+            type: 'string',
+            description: 'Name or partial name of the tiffin group.',
+          },
+          groupId: {
+            type: 'string',
+            description: 'ID of the target tiffin group.',
+          },
+          splitBetweenAll: {
+            type: 'boolean',
+            description: 'Whether to split the tiffin cost across all group members.',
           },
         },
         required: ['mealType'],
